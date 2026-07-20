@@ -1,11 +1,11 @@
 {
     "id": "F5F9AC51",
-    "path": null,
-    "project_path": null,
+    "path": "C:/Document/Serieux/Travail/Package/HmmAsh/R/HmmAsh.R",
+    "project_path": "R/HmmAsh.R",
     "type": "r_source",
     "hash": "0",
     "contents": "",
-    "dirty": true,
+    "dirty": false,
     "created": 1784580807952.0,
     "source_on_save": false,
     "relative_order": 1,
@@ -13,15 +13,15 @@
         "tempName": "Untitled1",
         "source_window_id": "",
         "Source": "Source",
-        "cursorPosition": "647,53",
-        "scrollLine": "633"
+        "cursorPosition": "896,0",
+        "scrollLine": "878"
     },
     "folds": "",
-    "lastKnownWriteTime": 1784580781,
-    "encoding": "",
+    "lastKnownWriteTime": 1784582120,
+    "encoding": "UTF-8",
     "collab_server": "",
     "source_window": "",
-    "last_content_update": 1784580809659,
+    "last_content_update": 1784582120811,
     "read_only": false,
     "read_only_alternatives": []
 }

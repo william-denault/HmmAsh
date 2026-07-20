@@ -1,0 +1,89 @@
+# Reproducible examples for ash_hmm.R
+ 
+
+# ---------------------------------------------------------------------------
+# 1. Exact reduction to the supplied two-state binary Markov model
+# ---------------------------------------------------------------------------
+set.seed(20260716)
+n <- 180L
+q_true <- 0.06
+state <- integer(n)
+state[1L] <- rbinom(1L, 1L, 0.5)
+for (t in 2:n) {
+  state[t] <- if (runif(1L) < q_true) 1L - state[t - 1L] else state[t - 1L]
+}
+index <- seq_len(n)
+se <- 0.30 + 0.06 * (1 + sin(2 * pi * index / 47))
+y <- rnorm(n, mean = state, sd = se)
+
+binary_fit <- fit_binary_markov(y, se)
+iid_fit <- fit_binary_markov(y, se, q_interval = c(0.5 - 1e-10, 0.5),
+                             grid_size = 5L)
+
+cat("true q:", q_true, " fitted q:", binary_fit$q, "\n")
+cat("true switches:", sum(diff(state) != 0),
+    " fitted switches:", sum(diff(binary_fit$viterbi_state) != 0), "\n")
+cat("iid accuracy:", mean(iid_fit$viterbi_state - 1L == state),
+    " HMM accuracy:", mean(binary_fit$viterbi_state - 1L == state), "\n")
+
+# The same fixed-q model evaluated through the general ash-HMM primitives.
+q <- binary_fit$q
+A_q <- matrix(c(1 - q, q, q, 1 - q), 2L, 2L, byrow = TRUE)
+binary_log_emission <- .ash_hmm_log_emission(
+  y, se, mu = c(0, 1), prior_sd = 0, rho = matrix(1, 2, 1))
+binary_as_general <- .ash_hmm_forward_backward(
+  binary_log_emission, A_q, c(0.5, 0.5), matrix(TRUE, 2, 2),
+  rep(1L, n))
+stopifnot(all.equal(binary_as_general$log_likelihood,
+                    binary_fit$log_likelihood, tolerance = 1e-10))
+
+# ---------------------------------------------------------------------------
+# 2. Multi-state ash-HMM
+# ---------------------------------------------------------------------------
+set.seed(73021)
+n <- 1200L
+mu <- c(0, -2, -1, 1, 2)        # state 1 is the zero/hub state
+prior_sd <- c(0, 0.25, 0.75)    # delta_mu plus two normal components
+mixture_weight <- c(0.55, 0.35, 0.10)
+m <- length(mu)
+
+A_true <- matrix(0, m, m)
+A_true[1L, ] <- c(0.98, rep(0.005, m - 1L))
+for (state_index in 2:m) {
+  A_true[state_index, 1L] <- 0.10
+  A_true[state_index, state_index] <- 0.90
+}
+pi_true <- .ash_hmm_stationary(A_true)
+
+state <- integer(n)
+component <- integer(n)
+state[1L] <- sample.int(m, 1L, prob = pi_true)
+for (t in 2:n) state[t] <- sample.int(m, 1L, prob = A_true[state[t - 1L], ])
+component <- sample.int(length(prior_sd), n, replace = TRUE,
+                        prob = mixture_weight)
+beta <- rnorm(n, mean = mu[state], sd = prior_sd[component])
+se <- runif(n, 0.30, 0.65)
+y <- rnorm(n, beta, se)
+
+fit <- fit_ash_hmm(
+  y, se, 
+  prior_sd = prior_sd,
+  topology = "hub",
+  shared_mixture = TRUE,         # recommended unless every state has ample data
+  estimate_init = FALSE,
+  maxiter = 200L,
+  tolerance = 1e-7,
+  verbose = TRUE
+)
+
+print(fit)
+cat("Viterbi state accuracy:", mean(fit$viterbi_state == state), "\n")
+cat("raw-effect RMSE:", sqrt(mean((y - beta)^2)),
+    " posterior-mean RMSE:", sqrt(mean((fit$posterior$mean - beta)^2)), "\n")
+cat("fitted shared ash weights:", fit$fitted$mixture_weight[1L, ], "\n")
+
+# To make state 1 a strict beta=0 state rather than an ash distribution
+# centered at zero, add: fixed_pointmass_states = 1L.
+#
+# For separate chromosomes or transcripts concatenated in y, pass a matching
+# sequence_id vector. No transition is introduced across a sequence boundary.
