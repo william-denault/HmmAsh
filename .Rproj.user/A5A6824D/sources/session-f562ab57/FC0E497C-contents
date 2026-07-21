@@ -40,6 +40,14 @@ fit_bumps <- fit_ash_hmm(
   verbose = TRUE,
   maxiter = 100
 )
+fit_doppler <- fit_ash_hmm(
+  noisy_doppler,
+  
+  rep(1, length(noisy_bumps)),
+  shared_mixture = FALSE,
+  verbose = TRUE,
+  maxiter = 100
+)
 
 plot(fit_bumps$posterior$mean)
 points(bumps, col="green", pch=19)
@@ -55,8 +63,8 @@ points(blocks, col="green", pch=19)
 lines(5*fit_block$posterior$lfsr,col="red")
 
 
+plot(fit_doppler$posterior$mean)
+points( doppler, col="green", pch=19)
+lines(5*fit_block$posterior$lfsr,col="red")
 
-
-mean((fit_block$posterior$mean-blocks)^2)
-
-mean((fit_block_old$x_post-blocks)^2)
+ 

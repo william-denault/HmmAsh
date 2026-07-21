@@ -26,5 +26,12 @@ plot(example_data$theta)
 
 fit <- fit_ash_hmm(
   example_data$x,
-  example_data$s
+  example_data$s,
+  shared_mixture = FALSE,
+  verbose = TRUE,
+  maxiter = 50
 )
+
+
+plot(fit$posterior$mean)
+plot(fit$posterior$lfsr)

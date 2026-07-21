@@ -22,3 +22,16 @@ simulate_transcript <- function(seed = 20260716L, n = 180L, q = 0.06) {
 
 example_data <- simulate_transcript()
 plot(example_data$theta)
+
+
+fit <- fit_ash_hmm(
+  example_data$x,
+  example_data$s,
+  shared_mixture = FALSE,
+  verbose = TRUE,
+  maxiter = 50
+)
+
+
+plot(fit$posterior$mean)
+plot(fit$posterior$lfsr)

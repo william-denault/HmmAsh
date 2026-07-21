@@ -1,27 +1,27 @@
 {
-    "id": "F5F9AC51",
-    "path": "C:/Document/Serieux/Travail/Package/HmmAsh/R/HmmAsh.R",
-    "project_path": "R/HmmAsh.R",
+    "id": "6E09DE5B",
+    "path": "C:/Document/Serieux/Travail/Package/HmmAsh/inst/simulate_transcript.R",
+    "project_path": "inst/simulate_transcript.R",
     "type": "r_source",
     "hash": "0",
     "contents": "",
     "dirty": false,
-    "created": 1784580807952.0,
+    "created": 1784581377659.0,
     "source_on_save": false,
-    "relative_order": 1,
+    "relative_order": 2,
     "properties": {
         "tempName": "Untitled1",
         "source_window_id": "",
         "Source": "Source",
-        "cursorPosition": "896,0",
-        "scrollLine": "878"
+        "cursorPosition": "31,14",
+        "scrollLine": "19"
     },
     "folds": "",
-    "lastKnownWriteTime": 1784582120,
+    "lastKnownWriteTime": 1784582270,
     "encoding": "UTF-8",
     "collab_server": "",
     "source_window": "",
-    "last_content_update": 1784582120811,
+    "last_content_update": 1784582270281,
     "read_only": false,
     "read_only_alternatives": []
 }
