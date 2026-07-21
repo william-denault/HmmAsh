@@ -28,8 +28,10 @@ fit <- fit_ash_hmm(
   example_data$x,
   example_data$s,
   shared_mixture = FALSE,
+  half_grid = 20,
+  grid_shape = 4,
   verbose = TRUE,
-  maxiter = 50
+  maxiter = 200
 )
 
 

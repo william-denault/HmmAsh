@@ -1,6 +1,6 @@
 library(wavethresh)
 
-set.seed(1)
+
 blocks  = DJ.EX()$blocks
 
 #kind of RNA seq
@@ -9,7 +9,7 @@ plot(noisy_blocks , pch=19)
 points(blocks, pch=19, size=.5, col="green")
 bumps  = DJ.EX()$bumps
 doppler  = DJ.EX()$doppler
-  plot(bumps)
+plot(bumps)
 noisy_bumps= bumps+rnorm(1024)
 
 noisy_doppler= doppler+rnorm(1024)
@@ -25,27 +25,27 @@ fit_block <- fit_ash_hmm(
   noisy_blocks,
   rep(1, length(noisy_bumps)),
   shared_mixture = FALSE,
-  verbose =FALSE,
-
+  verbose = TRUE,
+   
   maxiter = 50
 )
 
 
 fit_bumps <- fit_ash_hmm(
   noisy_bumps,
-
- rep(1, length(noisy_bumps)),
+  
+  rep(1, length(noisy_bumps)),
   shared_mixture = FALSE,
-  verbose = FALSE,
-  maxiter = 50
+  verbose = TRUE,
+  maxiter = 100
 )
 fit_doppler <- fit_ash_hmm(
   noisy_doppler,
-
+  
   rep(1, length(noisy_bumps)),
   shared_mixture = FALSE,
-  verbose = FALSE,
-  maxiter =50
+  verbose = TRUE,
+  maxiter =200
 )
 
 plot(fit_bumps$posterior$mean)
@@ -61,10 +61,8 @@ plot(fit_block$posterior$mean)
 points(blocks, col="green", pch=19)
 lines(5*fit_block$posterior$lfsr,col="red")
 
-mean((fit_block$posterior$mean-blocks)^2)
 
 plot(fit_doppler$posterior$mean)
 points( doppler, col="green", pch=19)
 lines(5*fit_block$posterior$lfsr,col="red")
 
-mean((fit_doppler$posterior$mean-doppler)^2)

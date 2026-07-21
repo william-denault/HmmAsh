@@ -16,7 +16,7 @@
 # Fit the general ash-HMM by a coherent EM/Baum-Welch algorithm.
 fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                         half_grid = 100L,
-                        grid_shape = 3,
+                        grid_shape = 1.5,
                         grid_expansion = 1.5,
                         grid_max_abs = NULL,
                         prefilter = NULL,
@@ -326,19 +326,6 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
   ans
 }
 
-print.ash_hmm_fit <- function(x, ...) {
-  cat("Adaptive-shrinkage HMM fit\n")
-  cat("  observations:", nrow(x$state_probability), "\n")
-  cat("  states:", ncol(x$state_probability))
-  if (isTRUE(x$grid$automatic)) {
-    cat(" (retained from", length(x$grid$full_mu), "automatic candidates)")
-  }
-  cat("\n")
-  cat("  iterations:", x$iterations,
-      if (x$converged) "(converged)" else "(maximum reached)", "\n")
-  cat("  log likelihood:", format(x$log_likelihood, digits = 8), "\n")
-  invisible(x)
-}
 
 # Backward-compatible two-input entry point matching the original function.
 fit_hmm <- function(x, sd, ...) {
@@ -347,6 +334,7 @@ fit_hmm <- function(x, sd, ...) {
 
 # Exact two-state reduction used in the supplied binary-Markov paper.
 # The state means are point masses and A(q) has one symmetric flip parameter.
+#' @export
 fit_binary_markov <- function(y, se, state_means = c(0, 1),
                               sequence_id = rep(1L, length(y)),
                               q_interval = c(0, 0.5),

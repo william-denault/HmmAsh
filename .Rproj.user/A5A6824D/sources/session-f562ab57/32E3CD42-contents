@@ -482,3 +482,21 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
        probability_zero = pmin(1, pmax(0, prob_zero)),
        lfsr = pmin(prob_ge_zero, prob_le_zero))
 }
+
+
+
+
+#' @export
+print.ash_hmm_fit <- function(x, ...) {
+  cat("Adaptive-shrinkage HMM fit\n")
+  cat("  observations:", nrow(x$state_probability), "\n")
+  cat("  states:", ncol(x$state_probability))
+  if (isTRUE(x$grid$automatic)) {
+    cat(" (retained from", length(x$grid$full_mu), "automatic candidates)")
+  }
+  cat("\n")
+  cat("  iterations:", x$iterations,
+      if (x$converged) "(converged)" else "(maximum reached)", "\n")
+  cat("  log likelihood:", format(x$log_likelihood, digits = 8), "\n")
+  invisible(x)
+}
