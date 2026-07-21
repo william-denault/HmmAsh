@@ -46,7 +46,7 @@ fit_doppler <- fit_ash_hmm(
   rep(1, length(noisy_bumps)),
   shared_mixture = FALSE,
   verbose = TRUE,
-  maxiter = 100
+  maxiter =200
 )
 
 plot(fit_bumps$posterior$mean)
