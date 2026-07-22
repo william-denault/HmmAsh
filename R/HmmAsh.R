@@ -21,9 +21,9 @@
 
 #' @export
 fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
-                        half_grid = 100L,
-                        grid_shape = 1.5,
-                        grid_expansion = 1.5,
+                        half_grid = 50L,
+                        grid_shape = 1.1,
+                        grid_expansion = 1.1,
                         grid_max_abs = NULL,
                         positive_state_means = TRUE,
                         positive_mean_floor = NULL,
@@ -33,7 +33,7 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                         screening_prior_sd = 0,
                         screening_block_size = 5000L,
                         sequence_id = rep(1L, length(y)),
-                        topology = c("hub", "full"),
+                        topology = c(  "full", "hub"),
                         transition_mask = NULL,
                         init_transition = NULL,
                         init_prob = NULL,
@@ -68,9 +68,9 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                         parameter_tolerance = 1e-6,
                         step_penalty = NULL,
                         step_penalty_scale = 1,
-                        maxiter = 200L,
-                        tolerance = 1e-8,
-                        verbose = FALSE) {
+                        maxiter = 100L,
+                        tolerance = 1e-5,
+                        verbose = TRUE) {
   call <- match.call()
   topology <- match.arg(topology)
   mean_bounds <- match.arg(mean_bounds)

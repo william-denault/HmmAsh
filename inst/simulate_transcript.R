@@ -1,3 +1,4 @@
+library(HmmAsh)
 simulate_transcript <- function(seed = 20260716L, n = 180L, q = 0.06) {
   set.seed(seed)
   theta <- integer(n)
@@ -28,12 +29,12 @@ fit <- fit_ash_hmm(
   example_data$x,
   example_data$s,
   shared_mixture = FALSE,
-  half_grid = 20,
-  grid_shape = 4,
+
   verbose = TRUE,
-  maxiter = 200
+  maxiter = 2000
 )
 
 
 plot(fit$posterior$mean)
-plot(fit$posterior$lfsr)
+plot(1-fit$posterior$lfsr)
+lines(example_data$theta)
