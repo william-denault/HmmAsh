@@ -1,0 +1,42 @@
+rm(list=ls())
+
+library(HmmAsh)
+simulate_transcript <- function(seed = 20260716L, n = 180L, q = 0.06) {
+  set.seed(seed)
+  theta <- integer(n)
+  theta[1L] <- stats::rbinom(1L, size = 1L, prob = 0.5)
+  if (n > 1L) {
+    for (i in 2:n) {
+      theta[i] <- if (stats::runif(1L) < q) {
+        1L - theta[i - 1L]
+      } else {
+        theta[i - 1L]
+      }
+    }
+  }
+
+
+  position <- seq_len(n)
+  s <- 0.30 + 0.06 * (1 + sin(2 * pi * position / 47))
+  x <- stats::rnorm(n, mean = theta, sd = s)
+  data.frame(position = position, theta = theta, s = s, x = x)
+}
+
+
+example_data <- simulate_transcript()
+plot(example_data$theta)
+
+
+fit <- fit_ash_hmm(
+  example_data$x,
+  example_data$s,
+  shared_mixture = FALSE,
+
+  verbose = TRUE,
+  maxiter = 100
+)
+
+
+plot(fit$posterior$mean)
+plot(1-fit$posterior$lfsr)
+lines(example_data$theta)
