@@ -1,0 +1,69 @@
+rm(list=ls())
+library(wavethresh)
+library(HmmAsh)
+set.seed(1)
+blocks  = DJ.EX()$blocks
+sd_lev= 1
+#kind of RNA seq
+noisy_blocks=blocks+rnorm(1024, sd=sd_lev)
+plot(noisy_blocks , pch=19)
+lines(blocks ,   col="green")
+bumps  = DJ.EX()$bumps
+doppler  = DJ.EX()$doppler
+  plot(bumps)
+noisy_bumps= bumps+rnorm(1024, sd=sd_lev)
+
+noisy_doppler= doppler+rnorm(1024, sd=sd_lev)
+#kind of ATACseq
+plot(noisy_bumps , pch=19)
+lines(bumps , col="green")
+
+plot(noisy_doppler , pch=19)
+lines(doppler , col="green")
+
+
+fit_block <- fit_ash_hmm(
+  noisy_blocks,
+  rep(sd_lev, length(noisy_bumps)),
+  shared_mixture = FALSE,
+
+  verbose = TRUE
+
+)
+
+
+fit_bumps <- fit_ash_hmm(
+  noisy_bumps,
+
+ rep(sd_lev, length(noisy_bumps)),
+  shared_mixture = FALSE,
+  verbose = TRUE
+)
+fit_doppler <- fit_ash_hmm(
+  noisy_doppler,
+
+  rep(sd_lev, length(noisy_bumps)),
+  shared_mixture = FALSE,
+  verbose = TRUE
+)
+
+plot(fit_bumps$posterior$mean, type='l')
+lines(bumps, col="green", pch=19)
+
+
+lines(10*fit_bumps$posterior$lfsr,col="red")
+
+mean((fit_bumps$posterior$mean-bumps)^2)
+
+
+plot(fit_block$posterior$mean, type='l')
+lines(blocks, col="green" )
+lines(5*fit_block$posterior$lfsr,col="red")
+
+mean((fit_block$posterior$mean-blocks)^2)
+
+plot(fit_doppler$posterior$mean , type='l')
+lines( doppler, col="green" )
+lines(5*fit_doppler$posterior$lfsr,col="red")
+
+mean((fit_doppler$posterior$mean-doppler)^2)

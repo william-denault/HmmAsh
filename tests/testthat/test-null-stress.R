@@ -19,7 +19,8 @@ testthat::test_that("Gaussian-null stress fits are exact, positive, and crash-fr
         topology = "full",
         null_state = "pointmass",
         maxiter = 10L,
-        tolerance = 1e-6),
+        tolerance = 1e-6,
+        verbose = FALSE),
       error = function(e) e)
 
     if (inherits(fit, "error")) {
@@ -79,7 +80,8 @@ testthat::test_that("adaptive null remains numerically valid on pure noise", {
         topology = "full",
         null_state = "adaptive",
         maxiter = 10L,
-        tolerance = 1e-6),
+        tolerance = 1e-6,
+        verbose = FALSE),
       error = function(e) e)
 
     if (inherits(fit, "error")) {
@@ -89,6 +91,8 @@ testthat::test_that("adaptive null remains numerically valid on pure noise", {
 
     valid[i] <-
       all(is.finite(fit$posterior$mean)) &&
+      all(fit$posterior$mean >= 0) &&
+      all(fit$posterior$probability_ge_zero == 1) &&
       all(is.finite(fit$state_probability)) &&
       all(abs(rowSums(fit$state_probability) - 1) < 1e-8) &&
       all(abs(rowSums(fit$fitted$transition) - 1) < 1e-8) &&

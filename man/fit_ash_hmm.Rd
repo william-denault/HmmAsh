@@ -9,12 +9,13 @@ fit_ash_hmm(
   se,
   mu = NULL,
   prior_sd = NULL,
-  half_grid = 25L,
-  grid_shape = 1.1,
-  grid_expansion = 1.1,
+  half_grid = 20L,
+  grid_shape = 1.5,
+  grid_expansion = 1.5,
   grid_max_abs = NULL,
   nonnegative_state_means = FALSE,
   positive_state_means = NULL,
+  effect_support = c("auto", "nonnegative", "real"),
   positive_mean_floor = NULL,
   prefilter = NULL,
   min_state_count = 0.5,
@@ -56,8 +57,8 @@ fit_ash_hmm(
   null_bic_margin = 0,
   parameter_tolerance = 1e-06,
   step_penalty = NULL,
-  step_penalty_scale = 1,
-  maxiter = 100L,
+  step_penalty_scale = 1.5,
+  maxiter = 50L,
   tolerance = 1e-05,
   verbose = TRUE
 )
@@ -89,12 +90,20 @@ absolute observation when constructing the automatic mean grid.}
 `max(abs(y))` when constructing the automatic grid.}
 
 \item{nonnegative_state_means}{Logical; if `TRUE` (default), use one state
-centered at zero and constrain every non-null state center to be strictly
-positive. If `FALSE`, allow signed state centers.}
+centered at zero, constrain every non-null state center to be strictly
+positive, and truncate all continuous ash components below at zero. Thus
+both prior and posterior effects have support on `[0, Inf)`. If `FALSE`,
+allow signed state centers and effects on the real line.}
 
 \item{positive_state_means}{Deprecated compatibility alias for
 `nonnegative_state_means`. Leave as `NULL` in new code. If both arguments
 are supplied, they must agree.}
+
+\item{effect_support}{Either `"auto"` (default), `"nonnegative"`, or
+`"real"`. `"auto"` follows `nonnegative_state_means`. An explicit value
+must agree with that argument. The nonnegative model uses exact
+truncated-normal marginal emissions and posterior moments; it does not
+clip an unconstrained posterior.}
 
 \item{positive_mean_floor}{Strict lower bound for learned non-null centers in
 nonnegative mode. The default is a scale-aware numerical value.}
@@ -215,7 +224,9 @@ active parameters for the strict-null information criterion.}
 \item{step_penalty}{Nonnegative penalty for each state change in the separate
 penalized decoder. `NULL` uses `step_penalty_scale * log(length(y))`.}
 
-\item{step_penalty_scale}{Nonnegative multiplier for the default step penalty.}
+\item{step_penalty_scale}{Nonnegative multiplier for the default step penalty.
+The default `1.5` accounts for both an added segment level and an unknown
+change location, reducing transient one-observation steps.}
 
 \item{maxiter}{Maximum number of generalized EM iterations.}
 
@@ -245,7 +256,8 @@ An object of class `ash_hmm_fit`, which is a list containing:
     are `NA`.}
   \item{fitted}{Fitted centers and scale grid, mixture weights, transition
     matrix and mask, initial probabilities, state identifiers and
-    occupancies, null-state type, constraints, and mean-learning settings.}
+    occupancies, null-state type, effect support, constraints, and
+    mean-learning settings.}
   \item{grid}{Automatic-grid settings, original and retained candidates,
     screening statistics, selected scale grid, and pruning history.}
   \item{log_likelihood,log_null,log_evidence_ratio}{The fitted HMM marginal
@@ -274,10 +286,12 @@ EM/Baum--Welch updates.
 \details{
 If `mu` is `NULL`, a dense grid of candidate state centers is constructed
 from `y` and screened before the first forward-backward pass. With
-`nonnegative_state_means = TRUE`, state 1 is fixed at zero and all non-null
-state centers are constrained to be strictly positive. This constrains the
-state centers, not every draw from a normal ash component. Set
-`nonnegative_state_means = FALSE` to construct a signed symmetric grid.
+`nonnegative_state_means = TRUE`, state 1 is fixed at zero, all non-null
+state centers are constrained to be strictly positive, and every continuous
+ash component is a normal distribution truncated to `[0, Inf)`. Consequently
+the latent effects and posterior means are nonnegative as well. Set
+`nonnegative_state_means = FALSE` to use ordinary Gaussian ash components on
+the real line and construct a signed symmetric center grid.
 
 Low-occupancy or nearly duplicated states can be proposed for pruning.
 A proposed deletion is accepted only after recomputing the complete HMM

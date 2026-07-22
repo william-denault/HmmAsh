@@ -1,4 +1,4 @@
-.ash_hmm_version <- "1.3.0-positive-steps-null-safe"
+.ash_hmm_version <- "2.0.0-one-sided-ash"
 
 #' Return the implementation version.
 #' @export
@@ -242,19 +242,60 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
   A / rowSums(A)
 }
 
-.ash_hmm_log_emission <- function(y, se, mu, prior_sd, rho) {
+# Log marginal density for one ash component. In the one-sided model the
+# continuous prior is N(mu, tau^2) truncated to [0, Inf). The identity
+#
+# p(y | beta >= 0) = p_untruncated(y) *
+#   Pr(beta >= 0 | y) / Pr(beta >= 0)
+#
+# gives an exact and stable normal-CDF expression for the convolution with
+# N(beta, se^2) observation noise.
+.ash_hmm_component_log_emission <- function(
+    y, se, mu, tau, effect_support = c("real", "nonnegative")) {
+  effect_support <- match.arg(effect_support)
+  if (tau == 0) {
+    if (effect_support == "nonnegative" && mu < 0) {
+      return(rep(-Inf, length(y)))
+    }
+    return(stats::dnorm(y, mean = mu, sd = se, log = TRUE))
+  }
+
+  observation_variance <- se^2 + tau^2
+  ans <- stats::dnorm(
+    y, mean = mu, sd = sqrt(observation_variance), log = TRUE)
+  if (effect_support == "real") return(ans)
+
+  posterior_mean <- (se^2 * mu + tau^2 * y) / observation_variance
+  posterior_sd <- tau * se / sqrt(observation_variance)
+  ans + stats::pnorm(
+    posterior_mean / posterior_sd, log.p = TRUE) -
+    stats::pnorm(mu / tau, log.p = TRUE)
+}
+
+.ash_hmm_component_log_emission_matrix <- function(
+    y, se, mu, prior_sd, effect_support = c("real", "nonnegative")) {
+  effect_support <- match.arg(effect_support)
+  ans <- matrix(-Inf, length(y), length(prior_sd))
+  for (component in seq_along(prior_sd)) {
+    ans[, component] <- .ash_hmm_component_log_emission(
+      y, se, mu, prior_sd[component], effect_support)
+  }
+  ans
+}
+
+.ash_hmm_log_emission <- function(
+    y, se, mu, prior_sd, rho,
+    effect_support = c("real", "nonnegative")) {
+  effect_support <- match.arg(effect_support)
   n <- length(y)
   m <- length(mu)
   l <- length(prior_sd)
   ans <- matrix(-Inf, n, m)
   log_rho <- .ash_hmm_safe_log(rho)
   for (state in seq_len(m)) {
-    terms <- matrix(-Inf, n, l)
-    for (component in seq_len(l)) {
-      terms[, component] <- log_rho[state, component] +
-        stats::dnorm(y, mean = mu[state],
-                     sd = sqrt(se^2 + prior_sd[component]^2), log = TRUE)
-    }
+    terms <- .ash_hmm_component_log_emission_matrix(
+      y, se, mu[state], prior_sd, effect_support)
+    terms <- sweep(terms, 2L, log_rho[state, ], "+")
     ans[, state] <- .ash_hmm_row_logsumexp(terms)
   }
   ans
@@ -352,8 +393,10 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
        starts = segments$starts)
 }
 
-.ash_hmm_component_statistics <- function(y, se, mu, prior_sd, rho,
-                                          log_emission, gamma) {
+.ash_hmm_component_statistics <- function(
+    y, se, mu, prior_sd, rho, log_emission, gamma,
+    effect_support = c("real", "nonnegative")) {
+  effect_support <- match.arg(effect_support)
   n <- length(y)
   m <- length(mu)
   l <- length(prior_sd)
@@ -361,21 +404,20 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
   mean_numerator <- mean_precision <- numeric(m)
   log_rho <- .ash_hmm_safe_log(rho)
   for (state in seq_len(m)) {
-    terms <- matrix(-Inf, n, l)
-    for (component in seq_len(l)) {
-      terms[, component] <- log_rho[state, component] +
-        stats::dnorm(y, mean = mu[state],
-                     sd = sqrt(se^2 + prior_sd[component]^2), log = TRUE)
-    }
+    terms <- .ash_hmm_component_log_emission_matrix(
+      y, se, mu[state], prior_sd, effect_support)
+    terms <- sweep(terms, 2L, log_rho[state, ], "+")
     conditional <- exp(terms - log_emission[, state])
     joint <- conditional * gamma[, state]
     counts[state, ] <- colSums(joint)
-    for (component in seq_len(l)) {
-      observation_variance <- se^2 + prior_sd[component]^2
-      mean_numerator[state] <- mean_numerator[state] +
-        sum(joint[, component] * y / observation_variance)
-      mean_precision[state] <- mean_precision[state] +
-        sum(joint[, component] / observation_variance)
+    if (effect_support == "real") {
+      for (component in seq_len(l)) {
+        observation_variance <- se^2 + prior_sd[component]^2
+        mean_numerator[state] <- mean_numerator[state] +
+          sum(joint[, component] * y / observation_variance)
+        mean_precision[state] <- mean_precision[state] +
+          sum(joint[, component] / observation_variance)
+      }
     }
   }
   list(counts = counts,
@@ -384,10 +426,12 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
        mean_precision = mean_precision)
 }
 
-.ash_hmm_component_counts <- function(y, se, mu, prior_sd, rho,
-                                      log_emission, gamma) {
+.ash_hmm_component_counts <- function(
+    y, se, mu, prior_sd, rho, log_emission, gamma,
+    effect_support = c("real", "nonnegative")) {
   .ash_hmm_component_statistics(y, se, mu, prior_sd, rho,
-                                log_emission, gamma)$counts
+                                log_emission, gamma,
+                                effect_support)$counts
 }
 
 # Nonoverlapping intervals around the current set of anchor centers. Restricting
@@ -460,6 +504,128 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
   ans[fixed] <- mu[fixed]
   list(mu = ans, raw = raw, updated = updated,
        lower = interval[, "lower"], upper = interval[, "upper"])
+}
+
+# Conditional maximization for centers in the one-sided ash model. Component
+# responsibilities are held at the current parameter snapshot, so each state's
+# criterion is a one-dimensional weighted sum of exact truncated-normal
+# component log emissions. Candidate moves are accepted only when this
+# conditional criterion does not decrease; damping is backtracked if needed.
+.ash_hmm_update_truncated_means <- function(
+    y, se, mu, anchor, prior_sd, rho, log_emission, gamma, statistics,
+    learn, fixed, minimum_count = 2,
+    eligible = rep(TRUE, length(mu)), damping = 1,
+    minimum = rep(0, length(mu)), bounds = c("voronoi", "none")) {
+  bounds <- match.arg(bounds)
+  m <- length(mu)
+  if (length(eligible) != m || anyNA(eligible)) {
+    stop("'eligible' must contain one non-missing value per state.",
+         call. = FALSE)
+  }
+  eligible <- as.logical(eligible)
+  damping <- rep(damping, length.out = m)
+  if (anyNA(damping) || any(!is.finite(damping)) ||
+      any(damping < 0 | damping > 1)) {
+    stop("Every mean damping value must lie in [0, 1].", call. = FALSE)
+  }
+  minimum <- rep(minimum, length.out = m)
+  if (anyNA(minimum) || any(!is.finite(minimum))) {
+    stop("One-sided mean lower bounds must be finite.", call. = FALSE)
+  }
+
+  interval <- if (bounds == "voronoi") {
+    .ash_hmm_voronoi_bounds(anchor)
+  } else {
+    cbind(lower = rep(-Inf, m), upper = rep(Inf, m))
+  }
+  interval[, "lower"] <- pmax(interval[, "lower"], minimum)
+
+  # stats::optimize requires finite intervals. This upper cap is deliberately
+  # conservative relative to both the starting grid and plausible Gaussian
+  # observations; it only affects the outermost anchor cell.
+  scale_pad <- max(1e-8, stats::median(se))
+  search_upper <- max(c(mu, anchor, y + 8 * se), na.rm = TRUE)
+  search_upper <- max(search_upper, max(interval[, "lower"]) + scale_pad)
+  infinite_upper <- !is.finite(interval[, "upper"])
+  interval[infinite_upper, "upper"] <- pmax(
+    search_upper, interval[infinite_upper, "lower"] + scale_pad)
+
+  raw <- ans <- mu
+  updated <- rep(FALSE, m)
+  criterion_before <- criterion_after <- rep(NA_real_, m)
+  if (!learn || !m) {
+    return(list(mu = ans, raw = raw, updated = updated,
+                lower = interval[, "lower"], upper = interval[, "upper"],
+                criterion_before = criterion_before,
+                criterion_after = criterion_after))
+  }
+
+  estimable <- eligible & statistics$occupancy >= minimum_count & damping > 0
+  estimable[fixed] <- FALSE
+  log_rho <- .ash_hmm_safe_log(rho)
+
+  for (state in which(estimable)) {
+    component_log_current <- .ash_hmm_component_log_emission_matrix(
+      y, se, mu[state], prior_sd, "nonnegative")
+    terms <- sweep(
+      component_log_current, 2L, log_rho[state, ], "+")
+    component_probability <- exp(terms - log_emission[, state])
+    joint <- component_probability * gamma[, state]
+    positive_weight <- joint > 0
+    if (!any(positive_weight)) next
+
+    conditional_objective <- function(center) {
+      component_log <- .ash_hmm_component_log_emission_matrix(
+        y, se, center, prior_sd, "nonnegative")
+      sum(joint[positive_weight] * component_log[positive_weight])
+    }
+
+    lower <- interval[state, "lower"]
+    upper <- interval[state, "upper"]
+    if (!is.finite(lower) || !is.finite(upper) || upper <= lower) next
+    current <- min(upper, max(lower, mu[state]))
+    current_value <- conditional_objective(current)
+    optimum <- stats::optimize(
+      function(center) -conditional_objective(center),
+      interval = c(lower, upper),
+      tol = sqrt(.Machine$double.eps))
+    candidates <- unique(c(current, lower, optimum$minimum, upper))
+    values <- vapply(candidates, conditional_objective, numeric(1L))
+    target <- candidates[which.max(values)]
+    target_value <- max(values)
+    raw[state] <- target
+    criterion_before[state] <- current_value
+
+    if (!is.finite(target_value) ||
+        target_value <= current_value + 1e-10 * (1 + abs(current_value))) {
+      criterion_after[state] <- current_value
+      next
+    }
+
+    fraction <- damping[state]
+    proposed <- current + fraction * (target - current)
+    proposed_value <- conditional_objective(proposed)
+    while (fraction > 2^-20 &&
+           proposed_value < current_value - 1e-10 * (1 + abs(current_value))) {
+      fraction <- fraction / 2
+      proposed <- current + fraction * (target - current)
+      proposed_value <- conditional_objective(proposed)
+    }
+    if (is.finite(proposed_value) && proposed_value >= current_value -
+        1e-10 * (1 + abs(current_value))) {
+      ans[state] <- proposed
+      updated[state] <- abs(proposed - mu[state]) > 1e-12
+      criterion_after[state] <- proposed_value
+    } else {
+      criterion_after[state] <- current_value
+    }
+  }
+
+  ans[fixed] <- mu[fixed]
+  list(mu = ans, raw = raw, updated = updated,
+       lower = interval[, "lower"], upper = interval[, "upper"],
+       criterion_before = criterion_before,
+       criterion_after = criterion_after)
 }
 
 # Effective dimension used by the optional BIC/extended-BIC comparison with
@@ -648,8 +814,40 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
   path
 }
 
-.ash_hmm_posterior_summary <- function(y, se, mu, prior_sd, rho,
-                                       log_emission, gamma) {
+# Mean and variance of a standard normal truncated below at -z. For very
+# negative z, direct inverse-Mills calculations suffer catastrophic
+# cancellation; the displayed tail expansions retain accuracy.
+.ash_hmm_lower_truncated_standard_moments <- function(z) {
+  mean_shift <- variance_factor <- numeric(length(z))
+  extreme <- z < -10
+
+  if (any(!extreme)) {
+    zz <- z[!extreme]
+    inverse_mills <- exp(
+      stats::dnorm(zz, log = TRUE) - stats::pnorm(zz, log.p = TRUE))
+    mean_shift[!extreme] <- inverse_mills
+    variance_factor[!extreme] <- pmax(
+      0, 1 - zz * inverse_mills - inverse_mills^2)
+  }
+
+  if (any(extreme)) {
+    a <- -z[extreme]
+    inverse_a <- 1 / a
+    # lambda(-a) - a and Var{Z | Z >= a}; terms through a^-7/a^-6.
+    residual <- inverse_a - 2 * inverse_a^3 +
+      10 * inverse_a^5 - 74 * inverse_a^7
+    mean_shift[extreme] <- a + residual
+    variance_factor[extreme] <- pmax(
+      0, inverse_a^2 - 6 * inverse_a^4 + 50 * inverse_a^6)
+  }
+
+  list(mean_shift = mean_shift, variance_factor = variance_factor)
+}
+
+.ash_hmm_posterior_summary <- function(
+    y, se, mu, prior_sd, rho, log_emission, gamma,
+    effect_support = c("real", "nonnegative")) {
+  effect_support <- match.arg(effect_support)
   n <- length(y)
   m <- length(mu)
   l <- length(prior_sd)
@@ -658,12 +856,9 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
   log_rho <- .ash_hmm_safe_log(rho)
 
   for (state in seq_len(m)) {
-    terms <- matrix(-Inf, n, l)
-    for (component in seq_len(l)) {
-      terms[, component] <- log_rho[state, component] +
-        stats::dnorm(y, mean = mu[state],
-                     sd = sqrt(se^2 + prior_sd[component]^2), log = TRUE)
-    }
+    terms <- .ash_hmm_component_log_emission_matrix(
+      y, se, mu[state], prior_sd, effect_support)
+    terms <- sweep(terms, 2L, log_rho[state, ], "+")
     component_probability <- exp(terms - log_emission[, state])
     state_mean <- state_second <- state_ge <- state_le <- state_zero <- numeric(n)
 
@@ -679,8 +874,20 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
         component_variance <- tau^2 * se^2 / (tau^2 + se^2)
         component_mean <- (se^2 * mu[state] + tau^2 * y) / (tau^2 + se^2)
         component_sd <- sqrt(component_variance)
-        ge <- stats::pnorm(component_mean / component_sd)
-        le <- stats::pnorm(-component_mean / component_sd)
+        if (effect_support == "nonnegative") {
+          z <- component_mean / component_sd
+          truncated <- .ash_hmm_lower_truncated_standard_moments(z)
+          component_mean <- component_mean +
+            component_sd * truncated$mean_shift
+          component_variance <- component_variance *
+            truncated$variance_factor
+          component_mean <- pmax(0, component_mean)
+          ge <- rep(1, n)
+          le <- rep(0, n)
+        } else {
+          ge <- stats::pnorm(component_mean / component_sd)
+          le <- stats::pnorm(-component_mean / component_sd)
+        }
         p0 <- rep(0, n)
       }
       w <- component_probability[, component]
@@ -699,6 +906,10 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
     prob_zero <- prob_zero + g * state_zero
   }
 
+  if (effect_support == "nonnegative") {
+    posterior_mean <- pmax(0, posterior_mean)
+    prob_ge_zero <- rep(1, n)
+  }
   posterior_variance <- pmax(0, posterior_second - posterior_mean^2)
   list(mean = posterior_mean,
        sd = sqrt(posterior_variance),
@@ -720,6 +931,9 @@ print.ash_hmm_fit <- function(x, ...) {
     cat(" (retained from", length(x$grid$full_mu), "automatic candidates)")
   }
   cat("\n")
+  if (!is.null(x$fitted$effect_support)) {
+    cat("  effect support:", x$fitted$effect_support, "\n")
+  }
   if (isTRUE(x$fitted$learn_state_means)) {
     moved <- sum(abs(x$fitted$mu - x$fitted$mean_anchor) > 1e-10)
     cat("  learned state means:", moved, "of", length(x$fitted$mu), "\n")

@@ -11,7 +11,8 @@ ash_hmm_step_stress_fit <- function(seed, amplitude, noise) {
     null_state = "pointmass",
     maxiter = 20L,
     tolerance = 1e-6,
-    prune_max_loglik_loss = 0.1)
+    prune_max_loglik_loss = 0.1,
+    verbose = FALSE)
   list(fit = fit, truth = truth)
 }
 
@@ -39,8 +40,11 @@ testthat::test_that("strong four-step signals recover every step", {
     valid[i] <-
       fit$fitted$mu[1L] == 0 &&
       all(fit$fitted$mu[-1L] > 0) &&
+      fit$fitted$effect_support == "nonnegative" &&
       all(abs(rowSums(fit$fitted$transition) - 1) < 1e-8) &&
-      all(is.finite(fit$posterior$mean))
+      all(is.finite(fit$posterior$mean)) &&
+      all(fit$posterior$mean >= 0) &&
+      all(fit$posterior$probability_ge_zero == 1)
   }
 
   testthat::expect_false(
@@ -117,7 +121,8 @@ testthat::test_that("recurrent levels are counted as separate contiguous steps",
         null_state = "pointmass",
         maxiter = 40L,
         tolerance = 1e-7,
-        prune_max_loglik_loss = 0.1),
+        prune_max_loglik_loss = 0.1,
+        verbose = FALSE),
       error = function(e) e)
 
     if (inherits(fit, "error")) {
@@ -130,6 +135,9 @@ testthat::test_that("recurrent levels are counted as separate contiguous steps",
     distinct_counts[i] <-
       fit$step_selection$occupied_state_count <
       fit$step_selection$step_count
+    if (any(fit$posterior$mean < 0)) {
+      errors[i] <- sprintf("replicate %d returned a negative posterior mean", i)
+    }
   }
 
   testthat::expect_false(

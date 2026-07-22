@@ -6,7 +6,11 @@
 # Model:
 #   y_t | beta_t ~ N(beta_t, se_t^2)
 #   Q_t is a finite-state Markov chain with transition matrix A
-#   beta_t | Q_t=m ~ sum_l rho[m,l] N(mu[m], prior_sd[l]^2)
+#   beta_t | Q_t=m ~ sum_l rho[m,l] G_ml
+#
+# In signed mode, G_ml is N(mu[m], prior_sd[l]^2). In the default one-sided
+# mode, continuous G_ml are those normals truncated to [0, Inf); the zero-scale
+# component remains a point mass at mu[m].
 #
 # prior_sd[1] must be zero, so the first component is a point mass at mu[m].
 # Candidate means and prior standard deviations may be generated from y and se.
@@ -30,10 +34,12 @@
 #' @details
 #' If `mu` is `NULL`, a dense grid of candidate state centers is constructed
 #' from `y` and screened before the first forward-backward pass. With
-#' `nonnegative_state_means = TRUE`, state 1 is fixed at zero and all non-null
-#' state centers are constrained to be strictly positive. This constrains the
-#' state centers, not every draw from a normal ash component. Set
-#' `nonnegative_state_means = FALSE` to construct a signed symmetric grid.
+#' `nonnegative_state_means = TRUE`, state 1 is fixed at zero, all non-null
+#' state centers are constrained to be strictly positive, and every continuous
+#' ash component is a normal distribution truncated to `[0, Inf)`. Consequently
+#' the latent effects and posterior means are nonnegative as well. Set
+#' `nonnegative_state_means = FALSE` to use ordinary Gaussian ash components on
+#' the real line and construct a signed symmetric center grid.
 #'
 #' Low-occupancy or nearly duplicated states can be proposed for pruning.
 #' A proposed deletion is accepted only after recomputing the complete HMM
@@ -59,11 +65,18 @@
 #' @param grid_max_abs Optional finite positive endpoint used instead of
 #'   `max(abs(y))` when constructing the automatic grid.
 #' @param nonnegative_state_means Logical; if `TRUE` (default), use one state
-#'   centered at zero and constrain every non-null state center to be strictly
-#'   positive. If `FALSE`, allow signed state centers.
+#'   centered at zero, constrain every non-null state center to be strictly
+#'   positive, and truncate all continuous ash components below at zero. Thus
+#'   both prior and posterior effects have support on `[0, Inf)`. If `FALSE`,
+#'   allow signed state centers and effects on the real line.
 #' @param positive_state_means Deprecated compatibility alias for
 #'   `nonnegative_state_means`. Leave as `NULL` in new code. If both arguments
 #'   are supplied, they must agree.
+#' @param effect_support Either `"auto"` (default), `"nonnegative"`, or
+#'   `"real"`. `"auto"` follows `nonnegative_state_means`. An explicit value
+#'   must agree with that argument. The nonnegative model uses exact
+#'   truncated-normal marginal emissions and posterior moments; it does not
+#'   clip an unconstrained posterior.
 #' @param positive_mean_floor Strict lower bound for learned non-null centers in
 #'   nonnegative mode. The default is a scale-aware numerical value.
 #' @param prefilter Logical controlling independent state-grid screening before
@@ -145,6 +158,8 @@
 #' @param step_penalty Nonnegative penalty for each state change in the separate
 #'   penalized decoder. `NULL` uses `step_penalty_scale * log(length(y))`.
 #' @param step_penalty_scale Nonnegative multiplier for the default step penalty.
+#'   The default `1.5` accounts for both an added segment level and an unknown
+#'   change location, reducing transient one-observation steps.
 #' @param maxiter Maximum number of generalized EM iterations.
 #' @param tolerance Positive relative convergence tolerance for the penalized
 #'   fixed-dimensional objective.
@@ -170,7 +185,8 @@
 #'     are `NA`.}
 #'   \item{fitted}{Fitted centers and scale grid, mixture weights, transition
 #'     matrix and mask, initial probabilities, state identifiers and
-#'     occupancies, null-state type, constraints, and mean-learning settings.}
+#'     occupancies, null-state type, effect support, constraints, and
+#'     mean-learning settings.}
 #'   \item{grid}{Automatic-grid settings, original and retained candidates,
 #'     screening statistics, selected scale grid, and pruning history.}
 #'   \item{log_likelihood,log_null,log_evidence_ratio}{The fitted HMM marginal
@@ -205,12 +221,13 @@
 #'
 #' @export
 fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
-                        half_grid = 25L,
-                        grid_shape = 1.1,
-                        grid_expansion = 1.1,
+                        half_grid = 20L,
+                        grid_shape = 1.5,
+                        grid_expansion = 1.5,
                         grid_max_abs = NULL,
                         nonnegative_state_means = FALSE,
                         positive_state_means = NULL,
+                        effect_support = c("auto", "nonnegative", "real"),
                         positive_mean_floor = NULL,
                         prefilter = NULL,
                         min_state_count = 0.5,
@@ -252,8 +269,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                         null_bic_margin = 0,
                         parameter_tolerance = 1e-6,
                         step_penalty = NULL,
-                        step_penalty_scale = 1,
-                        maxiter = 100L,
+                        step_penalty_scale = 1.5,
+                        maxiter = 50L,
                         tolerance = 1e-5,
                         verbose = TRUE) {
   call <- match.call()
@@ -262,6 +279,7 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
   mean_bounds <- match.arg(mean_bounds)
   null_model_selection <- match.arg(null_model_selection)
   null_state <- match.arg(null_state)
+  effect_support <- match.arg(effect_support)
   .ash_hmm_check_data(y, se, sequence_id)
   if (!is.null(positive_state_means)) {
     if (!is.logical(positive_state_means) ||
@@ -280,6 +298,14 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
   if (!is.logical(nonnegative_state_means) ||
       length(nonnegative_state_means) != 1L || is.na(nonnegative_state_means)) {
     stop("'nonnegative_state_means' must be TRUE or FALSE.", call. = FALSE)
+  }
+  expected_support <- if (nonnegative_state_means) "nonnegative" else "real"
+  if (effect_support == "auto") {
+    effect_support <- expected_support
+  } else if (effect_support != expected_support) {
+    stop(paste0("'effect_support = \"", effect_support,
+                "\"' conflicts with 'nonnegative_state_means = ",
+                nonnegative_state_means, "'."), call. = FALSE)
   }
 
   automatic_mu <- is.null(mu)
@@ -356,6 +382,7 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
   }
   grid_selection$settings$nonnegative_state_means <-
     nonnegative_state_means
+  grid_selection$settings$effect_support <- effect_support
 
   if (nonnegative_state_means) {
     if (mu[1L] != 0 || (length(mu) > 1L && any(mu[-1L] <= 0))) {
@@ -542,7 +569,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
     ans
   }
 
-  log_emission <- .ash_hmm_log_emission(y, se, mu, prior_sd, rho)
+  log_emission <- .ash_hmm_log_emission(
+    y, se, mu, prior_sd, rho, effect_support)
   fb <- .ash_hmm_forward_backward(log_emission, A, init_prob,
                                   transition_mask, sequence_id)
   objective <- objective_value(fb$log_likelihood, A, rho, init_prob)
@@ -562,7 +590,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
   for (iter in seq_len(maxiter)) {
     free_states <- setdiff(seq_len(m), fixed_pointmass_states)
     statistics <- .ash_hmm_component_statistics(
-      y, se, mu, prior_sd, rho, log_emission, fb$state_probability)
+      y, se, mu, prior_sd, rho, log_emission, fb$state_probability,
+      effect_support)
     component_counts <- statistics$counts
 
     rho_new <- rho
@@ -612,17 +641,32 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
     persistence_damping <- pmin(1, pmax(
       0, (diag(A_new) - mean_min_self_transition) /
         max(1e-8, 1 - mean_min_self_transition)))
-    mean_update <- .ash_hmm_update_means(
-      mu = mu, anchor = mean_anchor, statistics = statistics,
-      learn = learn_state_means && iter >= mean_update_start,
-      fixed = fixed_mean_states,
-      minimum_count = mean_min_effective_count,
-      eligible = mean_state_enabled,
-      damping = mean_damping * persistence_damping,
-      minimum = if (nonnegative_state_means) {
-        c(0, rep(positive_mean_floor, max(0L, m - 1L)))
-      } else rep(-Inf, m),
-      bounds = mean_bounds)
+    mean_lower_bound <- if (nonnegative_state_means) {
+      c(0, rep(positive_mean_floor, max(0L, m - 1L)))
+    } else rep(-Inf, m)
+    if (effect_support == "nonnegative") {
+      mean_update <- .ash_hmm_update_truncated_means(
+        y = y, se = se, mu = mu, anchor = mean_anchor,
+        prior_sd = prior_sd, rho = rho, log_emission = log_emission,
+        gamma = fb$state_probability, statistics = statistics,
+        learn = learn_state_means && iter >= mean_update_start,
+        fixed = fixed_mean_states,
+        minimum_count = mean_min_effective_count,
+        eligible = mean_state_enabled,
+        damping = mean_damping * persistence_damping,
+        minimum = mean_lower_bound,
+        bounds = mean_bounds)
+    } else {
+      mean_update <- .ash_hmm_update_means(
+        mu = mu, anchor = mean_anchor, statistics = statistics,
+        learn = learn_state_means && iter >= mean_update_start,
+        fixed = fixed_mean_states,
+        minimum_count = mean_min_effective_count,
+        eligible = mean_state_enabled,
+        damping = mean_damping * persistence_damping,
+        minimum = mean_lower_bound,
+        bounds = mean_bounds)
+    }
     mu_new <- mean_update$mu
 
     init_prob_new <- init_prob
@@ -632,7 +676,7 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
     }
 
     log_emission_new <- .ash_hmm_log_emission(
-      y, se, mu_new, prior_sd, rho_new)
+      y, se, mu_new, prior_sd, rho_new, effect_support)
     fb_new <- .ash_hmm_forward_backward(
       log_emission_new, A_new, init_prob_new, transition_mask, sequence_id)
     objective_new <- objective_value(
@@ -692,7 +736,7 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
               mixture_active_try[fixed_pointmass_try, ] <- FALSE
             }
             log_emission_try <- .ash_hmm_log_emission(
-              y, se, mu_try, prior_sd, rho_try)
+              y, se, mu_try, prior_sd, rho_try, effect_support)
             fb_try <- .ash_hmm_forward_backward(
               log_emission_try, A_try, init_try, mask_try, sequence_id)
             loss <- fb_new$log_likelihood - fb_try$log_likelihood
@@ -817,8 +861,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
     method = null_model_selection,
     selected = if (collapse_to_null) {
       "strict_null"
-    } else if (nonnegative_state_means) {
-      "nonnegative_ash_hmm"
+    } else if (effect_support == "nonnegative") {
+      "one_sided_ash_hmm"
     } else {
       "signed_ash_hmm"
     },
@@ -864,7 +908,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
     fixed_pointmass_states <- 1L
     fixed_mean_states <- 1L
     mean_state_enabled <- FALSE
-    log_emission <- .ash_hmm_log_emission(y, se, mu, prior_sd, rho)
+    log_emission <- .ash_hmm_log_emission(
+      y, se, mu, prior_sd, rho, effect_support)
     fb <- .ash_hmm_forward_backward(
       log_emission, A, init_prob, transition_mask, sequence_id)
     objective <- objective_value(
@@ -887,7 +932,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
   }
 
   posterior <- .ash_hmm_posterior_summary(
-    y, se, mu, prior_sd, rho, log_emission, fb$state_probability)
+    y, se, mu, prior_sd, rho, log_emission, fb$state_probability,
+    effect_support)
   viterbi_state <- .ash_hmm_viterbi(log_emission, A, init_prob,
                                     transition_mask, sequence_id)
   penalized_state <- .ash_hmm_penalized_viterbi(
@@ -926,6 +972,7 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                             state_id = state_id,
                             mean_anchor = mean_anchor,
                             state_occupancy = colSums(fb$state_probability),
+                            effect_support = effect_support,
                             learn_state_means = learn_state_means,
                             mean_bounds = mean_bounds,
                             mean_state_enabled = mean_state_enabled,
@@ -954,13 +1001,35 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
 }
 
 
-# Backward-compatible two-input entry point matching the original function.
+#' Backward-compatible ash-HMM entry point
+#'
+#' Calls [fit_ash_hmm()] using the original argument names `x` and `sd`.
+#'
+#' @param x Numeric vector of noisy effect estimates.
+#' @param sd Numeric vector of known standard errors.
+#' @param ... Additional arguments passed to [fit_ash_hmm()].
+#' @return An object of class `ash_hmm_fit`; see [fit_ash_hmm()].
+#' @export
 fit_hmm <- function(x, sd, ...) {
   fit_ash_hmm(y = x, se = sd, ...)
 }
 
-# Exact two-state reduction used in the supplied binary-Markov paper.
-# The state means are point masses and A(q) has one symmetric flip parameter.
+#' Fit the exact two-state binary Markov model
+#'
+#' Fits the point-state special case with a symmetric transition matrix
+#' `A(q) = matrix(c(1-q, q, q, 1-q), 2, 2, byrow = TRUE)`. The scalar `q` is
+#' selected by likelihood maximization over the requested interval.
+#'
+#' @param y Numeric vector of noisy observations.
+#' @param se Numeric vector of known, strictly positive standard errors.
+#' @param state_means Two finite point-state means.
+#' @param sequence_id Vector identifying independent contiguous sequences.
+#' @param q_interval Increasing length-two search interval contained in `[0,1]`.
+#' @param grid_size Number of initial likelihood evaluations over `q_interval`.
+#' @param init_prob Nonnegative length-two initial state distribution.
+#' @return A list containing the estimated flip probability `q`, transition
+#'   matrix, log likelihood, smoothed state probabilities, and boundary
+#'   probabilities.
 #' @export
 fit_binary_markov <- function(y, se, state_means = c(0, 1),
                               sequence_id = rep(1L, length(y)),
