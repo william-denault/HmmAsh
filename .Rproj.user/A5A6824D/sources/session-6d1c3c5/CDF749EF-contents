@@ -1,3 +1,8 @@
+.ash_hmm_version <- "1.2.0-native-learned-means"
+
+#' Return the implementation version.
+#' @export
+ash_hmm_version <- function() .ash_hmm_version
 
 .ash_hmm_logsumexp <- function(x) {
   if (!length(x)) return(-Inf)
@@ -344,12 +349,13 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
        starts = segments$starts)
 }
 
-.ash_hmm_component_counts <- function(y, se, mu, prior_sd, rho,
-                                      log_emission, gamma) {
+.ash_hmm_component_statistics <- function(y, se, mu, prior_sd, rho,
+                                          log_emission, gamma) {
   n <- length(y)
   m <- length(mu)
   l <- length(prior_sd)
   counts <- matrix(0, m, l)
+  mean_numerator <- mean_precision <- numeric(m)
   log_rho <- .ash_hmm_safe_log(rho)
   for (state in seq_len(m)) {
     terms <- matrix(-Inf, n, l)
@@ -359,9 +365,117 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
                      sd = sqrt(se^2 + prior_sd[component]^2), log = TRUE)
     }
     conditional <- exp(terms - log_emission[, state])
-    counts[state, ] <- colSums(conditional * gamma[, state])
+    joint <- conditional * gamma[, state]
+    counts[state, ] <- colSums(joint)
+    for (component in seq_len(l)) {
+      observation_variance <- se^2 + prior_sd[component]^2
+      mean_numerator[state] <- mean_numerator[state] +
+        sum(joint[, component] * y / observation_variance)
+      mean_precision[state] <- mean_precision[state] +
+        sum(joint[, component] / observation_variance)
+    }
   }
-  counts
+  list(counts = counts,
+       occupancy = rowSums(counts),
+       mean_numerator = mean_numerator,
+       mean_precision = mean_precision)
+}
+
+.ash_hmm_component_counts <- function(y, se, mu, prior_sd, rho,
+                                      log_emission, gamma) {
+  .ash_hmm_component_statistics(y, se, mu, prior_sd, rho,
+                                log_emission, gamma)$counts
+}
+
+# Nonoverlapping intervals around the current set of anchor centers. Restricting
+# each learned center to its own interval prevents label crossing and stops a
+# dense collection of states from collapsing onto the same plateau. When states
+# are pruned, recomputing these intervals automatically gives the survivors more
+# room to move.
+.ash_hmm_voronoi_bounds <- function(anchor) {
+  m <- length(anchor)
+  lower <- rep(-Inf, m)
+  upper <- rep(Inf, m)
+  if (m <= 1L) return(cbind(lower = lower, upper = upper))
+  if (anyDuplicated(anchor)) {
+    stop("State-center anchors must be distinct when using Voronoi bounds.",
+         call. = FALSE)
+  }
+  order_mu <- order(anchor)
+  sorted <- anchor[order_mu]
+  midpoint <- (sorted[-m] + sorted[-1L]) / 2
+  lower_sorted <- c(-Inf, midpoint)
+  upper_sorted <- c(midpoint, Inf)
+  lower[order_mu] <- lower_sorted
+  upper[order_mu] <- upper_sorted
+  cbind(lower = lower, upper = upper)
+}
+
+.ash_hmm_update_means <- function(mu, anchor, statistics,
+                                  learn, fixed, minimum_count = 2,
+                                  eligible = rep(TRUE, length(mu)),
+                                  damping = 1,
+                                  bounds = c("voronoi", "none")) {
+  bounds <- match.arg(bounds)
+  m <- length(mu)
+  if (length(eligible) != m || anyNA(eligible)) {
+    stop("'eligible' must contain one non-missing value per state.",
+         call. = FALSE)
+  }
+  eligible <- as.logical(eligible)
+  damping <- rep(damping, length.out = m)
+  if (anyNA(damping) || any(!is.finite(damping)) ||
+      any(damping < 0 | damping > 1)) {
+    stop("Every mean damping value must lie in [0, 1].", call. = FALSE)
+  }
+  if (!learn || !m) {
+    return(list(mu = mu, raw = mu, updated = rep(FALSE, m),
+                lower = rep(-Inf, m), upper = rep(Inf, m)))
+  }
+  interval <- if (bounds == "voronoi") {
+    .ash_hmm_voronoi_bounds(anchor)
+  } else {
+    cbind(lower = rep(-Inf, m), upper = rep(Inf, m))
+  }
+  raw <- mu
+  estimable <- eligible & statistics$occupancy >= minimum_count &
+    is.finite(statistics$mean_precision) & statistics$mean_precision > 0
+  estimable[fixed] <- FALSE
+  raw[estimable] <- statistics$mean_numerator[estimable] /
+    statistics$mean_precision[estimable]
+  target <- pmax(interval[, "lower"], pmin(interval[, "upper"], raw))
+  updated <- estimable & is.finite(target) & damping > 0
+  ans <- mu
+  ans[updated] <- mu[updated] +
+    damping[updated] * (target[updated] - mu[updated])
+  ans[fixed] <- mu[fixed]
+  list(mu = ans, raw = raw, updated = updated,
+       lower = interval[, "lower"], upper = interval[, "upper"])
+}
+
+# Mark the lower-occupancy member of each very close pair as a possible pruning
+# candidate. Actual deletion is accepted only after the caller checks the HMM
+# marginal likelihood.
+.ash_hmm_close_state_candidates <- function(mu, occupancy, distance,
+                                            protected = integer()) {
+  if (length(mu) < 2L || !is.finite(distance) || distance <= 0) {
+    return(integer())
+  }
+  ord <- order(mu)
+  close <- which(diff(mu[ord]) <= distance)
+  if (!length(close)) return(integer())
+  drop <- integer()
+  for (j in close) {
+    pair <- ord[c(j, j + 1L)]
+    eligible <- setdiff(pair, protected)
+    if (!length(eligible)) next
+    if (length(eligible) == 1L) {
+      drop <- c(drop, eligible)
+    } else {
+      drop <- c(drop, eligible[which.min(occupancy[eligible])])
+    }
+  }
+  unique(drop)
 }
 
 .ash_hmm_expand_prior <- function(x, nr, nc, name) {
@@ -495,6 +609,13 @@ print.ash_hmm_fit <- function(x, ...) {
     cat(" (retained from", length(x$grid$full_mu), "automatic candidates)")
   }
   cat("\n")
+  if (isTRUE(x$fitted$learn_state_means)) {
+    moved <- sum(abs(x$fitted$mu - x$fitted$mean_anchor) > 1e-10)
+    cat("  learned state means:", moved, "of", length(x$fitted$mu), "\n")
+  }
+  if (!is.null(x$pruning_history) && nrow(x$pruning_history)) {
+    cat("  dynamically pruned states:", nrow(x$pruning_history), "\n")
+  }
   cat("  iterations:", x$iterations,
       if (x$converged) "(converged)" else "(maximum reached)", "\n")
   cat("  log likelihood:", format(x$log_likelihood, digits = 8), "\n")

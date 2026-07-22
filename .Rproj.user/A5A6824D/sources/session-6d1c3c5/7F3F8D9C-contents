@@ -1,0 +1,1280 @@
+# ash_hmm.R
+#
+# An adaptive-shrinkage hidden Markov model for heteroskedastic normal
+# observations. The default mixture engine calls ashr::ash separately for
+# every non-atomic state; a dependency-free native engine is also available.
+#
+# Model:
+#   y_t | beta_t ~ N(beta_t, se_t^2)
+#   Q_t is a finite-state Markov chain with transition matrix A
+#   beta_t | Q_t=m ~ sum_l rho[m,l] N(mu[m], prior_sd[l]^2)
+#
+# prior_sd[1] must be zero, so the first component is a point mass at mu[m].
+# The means and prior standard deviations may be generated from y and se, but
+# are fixed before EM; A, rho, and optionally the initial distribution are fit.
+
+.ash_hmm_logsumexp <- function(x) {
+  if (!length(x)) return(-Inf)
+  z <- max(x)
+  if (!is.finite(z)) return(z)
+  z + log(sum(exp(x - z)))
+}
+
+.ash_hmm_row_logsumexp <- function(x) {
+  if (is.null(dim(x))) return(.ash_hmm_logsumexp(x))
+  z <- apply(x, 1L, max)
+  ans <- rep(-Inf, nrow(x))
+  ok <- is.finite(z)
+  if (any(ok)) {
+    ans[ok] <- z[ok] + log(rowSums(exp(x[ok, , drop = FALSE] - z[ok])))
+  }
+  ans
+}
+
+.ash_hmm_safe_log <- function(x) {
+  ans <- rep(-Inf, length(x))
+  ans[x > 0] <- log(x[x > 0])
+  dim(ans) <- dim(x)
+  ans
+}
+
+.ash_hmm_normalize <- function(x, fallback = NULL) {
+  s <- sum(x)
+  if (is.finite(s) && s > 0) return(x / s)
+  if (is.null(fallback)) stop("Cannot normalize a zero-mass vector.", call. = FALSE)
+  fallback / sum(fallback)
+}
+
+.ash_hmm_check_data <- function(y, se, sequence_id) {
+  if (!is.numeric(y) || !is.numeric(se) || length(y) != length(se)) {
+    stop("'y' and 'se' must be numeric vectors of equal length.", call. = FALSE)
+  }
+  if (!length(y)) stop("At least one observation is required.", call. = FALSE)
+  if (anyNA(y) || anyNA(se) || any(!is.finite(y)) || any(!is.finite(se))) {
+    stop("'y' and 'se' must be finite and non-missing.", call. = FALSE)
+  }
+  if (any(se <= 0)) stop("Every standard error must be strictly positive.", call. = FALSE)
+  if (length(sequence_id) != length(y) || anyNA(sequence_id)) {
+    stop("'sequence_id' must contain one non-missing value per observation.", call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+# Stephens-style geometric grid, including the point-mass component at zero.
+ash_sigma_grid <- function(y, se, multiplier = sqrt(2), sigma_min = NULL,
+                           sigma_max = NULL) {
+  .ash_hmm_check_data(y, se, rep(1L, length(y)))
+  if (!is.numeric(multiplier) || length(multiplier) != 1L || multiplier <= 1) {
+    stop("'multiplier' must be a scalar greater than one.", call. = FALSE)
+  }
+  if (is.null(sigma_min)) sigma_min <- min(se) / 10
+  if (is.null(sigma_max)) {
+    signal_var <- max(y^2 - se^2)
+    sigma_max <- if (signal_var > 0) 2 * sqrt(signal_var) else 8 * sigma_min
+  }
+  if (sigma_min <= 0 || sigma_max < sigma_min) {
+    stop("Require 0 < sigma_min <= sigma_max.", call. = FALSE)
+  }
+  positive <- sigma_min * multiplier^(0:ceiling(log(sigma_max / sigma_min) /
+                                                  log(multiplier)))
+  positive[length(positive)] <- sigma_max
+  sort(unique(c(0, positive)))
+}
+
+# Symmetric state-mean grid with the zero/hub state first.
+ash_mu_grid <- function(y, half_grid = 100L, shape = 3, expansion = 1.5,
+                        max_abs = NULL) {
+  if (!is.numeric(y) || !length(y) || anyNA(y) || any(!is.finite(y))) {
+    stop("'y' must be a finite numeric vector.", call. = FALSE)
+  }
+  half_grid <- as.integer(half_grid)
+  if (half_grid < 1L || shape <= 0 || expansion <= 0) {
+    stop("Require half_grid >= 1, shape > 0, and expansion > 0.", call. = FALSE)
+  }
+  if (is.null(max_abs)) max_abs <- max(abs(y))
+  if (!is.finite(max_abs) || max_abs <= 0) max_abs <- 1
+  positive <- seq(0, 1, length.out = half_grid)^(1 / shape) * expansion * max_abs
+  c(positive, -positive[-1L])
+}
+
+# Screen a candidate state-mean grid before any HMM forward-backward pass.
+# Each observation is assigned soft iid weights under point emissions centered
+# on the candidate means. Their column sums are effective observation counts.
+.ash_hmm_prefilter_mu <- function(y, se, mu,
+                                  min_state_count = 2,
+                                  min_state_fraction = 1e-5,
+                                  screening_prior_sd = 0,
+                                  block_size = 5000L) {
+  if (!is.numeric(mu) || !length(mu) || anyNA(mu) || any(!is.finite(mu))) {
+    stop("'mu' must be a finite numeric vector.", call. = FALSE)
+  }
+  if (length(min_state_count) != 1L || !is.finite(min_state_count) ||
+      min_state_count < 0 || length(min_state_fraction) != 1L ||
+      !is.finite(min_state_fraction) || min_state_fraction < 0 ||
+      min_state_fraction > 1) {
+    stop("Grid-screening count and fraction thresholds must be valid scalars.",
+         call. = FALSE)
+  }
+  if (length(screening_prior_sd) != 1L || !is.finite(screening_prior_sd) ||
+      screening_prior_sd < 0) {
+    stop("'screening_prior_sd' must be a finite nonnegative scalar.",
+         call. = FALSE)
+  }
+  block_size <- as.integer(block_size)
+  if (block_size < 1L) stop("'block_size' must be positive.", call. = FALSE)
+  
+  n <- length(y)
+  m <- length(mu)
+  effective_count <- numeric(m)
+  starts <- seq.int(1L, n, by = block_size)
+  
+  for (first in starts) {
+    last <- min(n, first + block_size - 1L)
+    index <- first:last
+    log_score <- matrix(-Inf, length(index), m)
+    for (state in seq_len(m)) {
+      log_score[, state] <- stats::dnorm(
+        y[index], mean = mu[state],
+        sd = sqrt(se[index]^2 + screening_prior_sd^2), log = TRUE)
+    }
+    log_normalizer <- .ash_hmm_row_logsumexp(log_score)
+    effective_count <- effective_count +
+      colSums(exp(log_score - log_normalizer))
+  }
+  
+  cutoff <- max(min_state_count, n * min_state_fraction)
+  keep <- which(effective_count >= cutoff)
+  # State 1 is the zero/hub state for automatically constructed grids and is
+  # retained even when the data are entirely nonzero.
+  keep <- sort(unique(c(1L, keep)))
+  
+  list(full_mu = mu,
+       selected_mu = mu[keep],
+       selected_index = keep,
+       removed_index = setdiff(seq_len(m), keep),
+       effective_count = effective_count,
+       mean_weight = effective_count / n,
+       cutoff = cutoff,
+       settings = list(min_state_count = min_state_count,
+                       min_state_fraction = min_state_fraction,
+                       screening_prior_sd = screening_prior_sd,
+                       block_size = block_size))
+}
+
+# Construct the original symmetric power grid and remove unsupported states
+# before fitting the HMM. This is also useful for inspecting the automatic
+# choice without fitting a model.
+ash_hmm_select_grid <- function(y, se,
+                                half_grid = 100L,
+                                shape = 3,
+                                expansion = 1.5,
+                                max_abs = NULL,
+                                min_state_count = 2,
+                                min_state_fraction = 1e-5,
+                                screening_prior_sd = 0,
+                                block_size = 5000L) {
+  .ash_hmm_check_data(y, se, rep(1L, length(y)))
+  candidate <- ash_mu_grid(y, half_grid = half_grid, shape = shape,
+                           expansion = expansion, max_abs = max_abs)
+  ans <- .ash_hmm_prefilter_mu(
+    y, se, candidate,
+    min_state_count = min_state_count,
+    min_state_fraction = min_state_fraction,
+    screening_prior_sd = screening_prior_sd,
+    block_size = block_size)
+  ans$automatic <- TRUE
+  ans
+}
+
+ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
+  topology <- match.arg(topology)
+  n_states <- as.integer(n_states)
+  if (n_states < 1L) stop("'n_states' must be positive.", call. = FALSE)
+  if (topology == "full") return(matrix(TRUE, n_states, n_states))
+  
+  # Hub-and-spoke: the zero/hub state is state 1. A non-hub state may
+  # persist or return to the hub, but may not jump directly to another spoke.
+  mask <- diag(TRUE, n_states)
+  mask[1L, ] <- TRUE
+  mask[, 1L] <- TRUE
+  mask
+}
+
+.ash_hmm_initial_transition <- function(mask, stay_probability = 0.95) {
+  m <- nrow(mask)
+  stay_probability <- rep(stay_probability, length.out = m)
+  if (any(stay_probability < 0 | stay_probability > 1)) {
+    stop("'stay_probability' must lie in [0, 1].", call. = FALSE)
+  }
+  A <- matrix(0, m, m)
+  for (i in seq_len(m)) {
+    allowed <- which(mask[i, ])
+    if (length(allowed) == 1L) {
+      A[i, allowed] <- 1
+    } else {
+      A[i, i] <- stay_probability[i]
+      other <- setdiff(allowed, i)
+      A[i, other] <- (1 - stay_probability[i]) / length(other)
+    }
+  }
+  A
+}
+
+.ash_hmm_stationary <- function(A, tolerance = 1e-13, maxiter = 100000L) {
+  p <- rep(1 / nrow(A), nrow(A))
+  for (iter in seq_len(maxiter)) {
+    p_new <- drop(p %*% A)
+    if (max(abs(p_new - p)) < tolerance) return(.ash_hmm_normalize(p_new))
+    p <- p_new
+  }
+  warning("Stationary-distribution iteration did not converge; using its last iterate.")
+  .ash_hmm_normalize(p)
+}
+
+.ash_hmm_validate_transition <- function(A, mask, tolerance = 1e-10) {
+  m <- nrow(mask)
+  if (!is.matrix(A) || any(dim(A) != c(m, m)) || anyNA(A) ||
+      any(!is.finite(A)) || any(A < 0)) {
+    stop("'init_transition' must be a finite, nonnegative M by M matrix.", call. = FALSE)
+  }
+  if (any(A[!mask] > tolerance)) {
+    stop("'init_transition' has positive mass on a structurally forbidden edge.", call. = FALSE)
+  }
+  rs <- rowSums(A)
+  if (any(abs(rs - 1) > tolerance)) {
+    stop("Every row of 'init_transition' must sum to one.", call. = FALSE)
+  }
+  A[!mask] <- 0
+  A / rowSums(A)
+}
+
+.ash_hmm_log_emission <- function(y, se, mu, prior_sd, rho) {
+  n <- length(y)
+  m <- length(mu)
+  l <- length(prior_sd)
+  ans <- matrix(-Inf, n, m)
+  log_rho <- .ash_hmm_safe_log(rho)
+  for (state in seq_len(m)) {
+    terms <- matrix(-Inf, n, l)
+    for (component in seq_len(l)) {
+      terms[, component] <- log_rho[state, component] +
+        stats::dnorm(y, mean = mu[state],
+                     sd = sqrt(se^2 + prior_sd[component]^2), log = TRUE)
+    }
+    ans[, state] <- .ash_hmm_row_logsumexp(terms)
+  }
+  ans
+}
+
+.ash_hmm_require_ashr <- function() {
+  if (!requireNamespace("ashr", quietly = TRUE)) {
+    stop(paste0(
+      "The default 'ashr' mixture engine requires the ashr package. ",
+      "Install it with install.packages(\"ashr\"), or use ",
+      "mixture_engine = \"native\"."), call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+# Extract a fitted normal mixture through ashr's public interface. Keeping
+# this in one helper avoids depending on the internal layout of an ash object.
+.ash_hmm_ash_components <- function(ash_fit) {
+  g <- ashr::get_fitted_g(ash_fit)
+  probability <- as.numeric(ashr::mixprop(g))
+  mean <- as.numeric(ashr::comp_mean(g))
+  sd <- as.numeric(ashr::comp_sd(g))
+  if (!length(probability) || length(mean) != length(probability) ||
+      length(sd) != length(probability) || anyNA(probability) ||
+      anyNA(mean) || anyNA(sd)) {
+    stop("ashr returned an invalid fitted normal mixture.", call. = FALSE)
+  }
+  list(probability = probability, mean = mean, sd = sd, g = g)
+}
+
+.ash_hmm_log_emission_ashr <- function(y, se, mu, ash_fit, pointmass) {
+  n <- length(y)
+  m <- length(mu)
+  ans <- matrix(-Inf, n, m)
+  for (state in seq_len(m)) {
+    if (pointmass[state] || is.null(ash_fit[[state]])) {
+      ans[, state] <- stats::dnorm(y, mean = mu[state], sd = se, log = TRUE)
+      next
+    }
+    component <- .ash_hmm_ash_components(ash_fit[[state]])
+    k <- length(component$probability)
+    terms <- matrix(-Inf, n, k)
+    log_probability <- .ash_hmm_safe_log(component$probability)
+    for (j in seq_len(k)) {
+      terms[, j] <- log_probability[j] + stats::dnorm(
+        y, mean = component$mean[j],
+        sd = sqrt(se^2 + component$sd[j]^2), log = TRUE)
+    }
+    ans[, state] <- .ash_hmm_row_logsumexp(terms)
+  }
+  ans
+}
+
+# Fractional state probabilities are the observation weights in the ash
+# M-step. The scale grid is fixed before HMM fitting; only each state's
+# mixture proportions are learned. A state with negligible occupancy keeps
+# its previous fit, or starts as a point mass at its state mean.
+.ash_hmm_fit_ash_states <- function(y, se, mu, prior_sd, gamma,
+                                    fixed_pointmass_states,
+                                    previous_fit = NULL,
+                                    previous_pointmass = NULL,
+                                    min_effective_count = 2,
+                                    prior = "nullbiased",
+                                    nullweight = 10,
+                                    control = list(),
+                                    pi_thresh = 1e-10,
+                                    verbose = FALSE) {
+  .ash_hmm_require_ashr()
+  m <- length(mu)
+  if (is.null(previous_fit)) previous_fit <- vector("list", m)
+  if (is.null(previous_pointmass)) previous_pointmass <- rep(TRUE, m)
+  ash_fit <- previous_fit
+  pointmass <- previous_pointmass
+  pointmass[fixed_pointmass_states] <- TRUE
+  ash_fit[fixed_pointmass_states] <- rep(list(NULL),
+                                         length(fixed_pointmass_states))
+  effective_count <- colSums(gamma)
+  positive_scale <- prior_sd[prior_sd > 0]
+  failed <- integer()
+  
+  for (state in setdiff(seq_len(m), fixed_pointmass_states)) {
+    if (!length(positive_scale) ||
+        effective_count[state] < min_effective_count) {
+      if (is.null(ash_fit[[state]])) pointmass[state] <- TRUE
+      next
+    }
+    
+    candidate <- tryCatch(
+      ashr::ash(
+        betahat = y,
+        sebetahat = se,
+        mixcompdist = "normal",
+        mode = mu[state],
+        mixsd = positive_scale,
+        pointmass = TRUE,
+        prior = prior,
+        nullweight = nullweight,
+        optmethod = "w_mixEM",
+        weights = gamma[, state],
+        outputlevel = 2,
+        control = control,
+        pi_thresh = pi_thresh),
+      error = function(e) e)
+    
+    if (inherits(candidate, "error")) {
+      failed <- c(failed, state)
+      if (is.null(ash_fit[[state]])) pointmass[state] <- TRUE
+      if (verbose) {
+        message(sprintf("ashr state %d retained its previous prior: %s",
+                        state, conditionMessage(candidate)))
+      }
+    } else {
+      ash_fit[[state]] <- candidate
+      pointmass[state] <- FALSE
+    }
+  }
+  
+  list(fit = ash_fit, pointmass = pointmass,
+       effective_count = effective_count, failed = failed)
+}
+
+.ash_hmm_ash_penalty <- function(ash_fit, pointmass, prior, nullweight) {
+  penalty <- 0
+  for (state in seq_along(ash_fit)) {
+    if (pointmass[state] || is.null(ash_fit[[state]])) next
+    component <- .ash_hmm_ash_components(ash_fit[[state]])
+    probability <- component$probability
+    alpha <- if (is.character(prior)) {
+      if (prior == "uniform") rep(1, length(probability))
+      else {
+        value <- rep(1, length(probability))
+        value[which.min(component$sd)] <- nullweight
+        value
+      }
+    } else {
+      if (length(prior) != length(probability)) {
+        stop("Numeric 'ash_prior' has the wrong length for the ash grid.",
+             call. = FALSE)
+      }
+      prior
+    }
+    use <- alpha > 1
+    if (any(use)) {
+      if (any(probability[use] <= 0)) return(-Inf)
+      penalty <- penalty + sum((alpha[use] - 1) * log(probability[use]))
+    }
+  }
+  penalty
+}
+
+.ash_hmm_ash_weight_matrix <- function(ash_fit, pointmass, prior_sd) {
+  ans <- matrix(0, length(ash_fit), length(prior_sd))
+  for (state in seq_along(ash_fit)) {
+    if (pointmass[state] || is.null(ash_fit[[state]])) {
+      ans[state, 1L] <- 1
+      next
+    }
+    component <- .ash_hmm_ash_components(ash_fit[[state]])
+    for (j in seq_along(component$probability)) {
+      target <- which.min(abs(prior_sd - component$sd[j]))
+      ans[state, target] <- ans[state, target] + component$probability[j]
+    }
+  }
+  ans / rowSums(ans)
+}
+
+.ash_hmm_segments <- function(sequence_id) {
+  starts <- c(1L, which(sequence_id[-1L] != sequence_id[-length(sequence_id)]) + 1L)
+  ends <- c(starts[-1L] - 1L, length(sequence_id))
+  list(starts = starts, ends = ends)
+}
+
+.ash_hmm_forward_backward <- function(log_emission, A, init_prob, mask,
+                                      sequence_id) {
+  n <- nrow(log_emission)
+  m <- ncol(log_emission)
+  log_A <- .ash_hmm_safe_log(A)
+  log_pi <- .ash_hmm_safe_log(init_prob)
+  edge <- which(mask, arr.ind = TRUE)
+  edge_from <- edge[, 1L]
+  edge_to <- edge[, 2L]
+  incoming <- lapply(seq_len(m), function(j) which(edge_to == j))
+  outgoing <- lapply(seq_len(m), function(i) which(edge_from == i))
+  segments <- .ash_hmm_segments(sequence_id)
+  
+  log_alpha <- matrix(-Inf, n, m)
+  log_beta <- matrix(-Inf, n, m)
+  gamma <- matrix(0, n, m)
+  transition_counts <- matrix(0, m, m)
+  boundary_probability <- rep(NA_real_, max(0L, n - 1L))
+  total_log_likelihood <- 0
+  
+  for (segment in seq_along(segments$starts)) {
+    first <- segments$starts[segment]
+    last <- segments$ends[segment]
+    log_alpha[first, ] <- log_pi + log_emission[first, ]
+    
+    if (first < last) {
+      for (t in (first + 1L):last) {
+        for (state in seq_len(m)) {
+          e <- incoming[[state]]
+          log_alpha[t, state] <- log_emission[t, state] +
+            .ash_hmm_logsumexp(log_alpha[t - 1L, edge_from[e]] +
+                                 log_A[cbind(edge_from[e], edge_to[e])])
+        }
+      }
+    }
+    
+    segment_ll <- .ash_hmm_logsumexp(log_alpha[last, ])
+    if (!is.finite(segment_ll)) {
+      stop("The HMM assigns zero probability to an observed sequence.", call. = FALSE)
+    }
+    total_log_likelihood <- total_log_likelihood + segment_ll
+    log_beta[last, ] <- 0
+    
+    if (first < last) {
+      for (t in (last - 1L):first) {
+        for (state in seq_len(m)) {
+          e <- outgoing[[state]]
+          log_beta[t, state] <- .ash_hmm_logsumexp(
+            log_A[cbind(edge_from[e], edge_to[e])] +
+              log_emission[t + 1L, edge_to[e]] +
+              log_beta[t + 1L, edge_to[e]])
+        }
+      }
+    }
+    
+    for (t in first:last) {
+      lg <- log_alpha[t, ] + log_beta[t, ] - segment_ll
+      lg <- lg - .ash_hmm_logsumexp(lg)
+      gamma[t, ] <- exp(lg)
+    }
+    
+    if (first < last) {
+      for (t in first:(last - 1L)) {
+        log_xi <- log_alpha[t, edge_from] +
+          log_A[cbind(edge_from, edge_to)] +
+          log_emission[t + 1L, edge_to] +
+          log_beta[t + 1L, edge_to] - segment_ll
+        log_xi <- log_xi - .ash_hmm_logsumexp(log_xi)
+        xi <- exp(log_xi)
+        for (e in seq_along(xi)) {
+          transition_counts[edge_from[e], edge_to[e]] <-
+            transition_counts[edge_from[e], edge_to[e]] + xi[e]
+        }
+        boundary_probability[t] <- sum(xi[edge_from != edge_to])
+      }
+    }
+  }
+  
+  list(log_likelihood = total_log_likelihood,
+       state_probability = gamma,
+       transition_counts = transition_counts,
+       boundary_probability = boundary_probability,
+       initial_counts = colSums(gamma[segments$starts, , drop = FALSE]),
+       starts = segments$starts)
+}
+
+.ash_hmm_component_counts <- function(y, se, mu, prior_sd, rho,
+                                      log_emission, gamma) {
+  n <- length(y)
+  m <- length(mu)
+  l <- length(prior_sd)
+  counts <- matrix(0, m, l)
+  log_rho <- .ash_hmm_safe_log(rho)
+  for (state in seq_len(m)) {
+    terms <- matrix(-Inf, n, l)
+    for (component in seq_len(l)) {
+      terms[, component] <- log_rho[state, component] +
+        stats::dnorm(y, mean = mu[state],
+                     sd = sqrt(se^2 + prior_sd[component]^2), log = TRUE)
+    }
+    conditional <- exp(terms - log_emission[, state])
+    counts[state, ] <- colSums(conditional * gamma[, state])
+  }
+  counts
+}
+
+.ash_hmm_expand_prior <- function(x, nr, nc, name) {
+  if (length(x) == 1L) x <- matrix(x, nr, nc)
+  else if (length(x) == nc) x <- matrix(rep(x, each = nr), nr, nc)
+  else if (is.matrix(x) && all(dim(x) == c(nr, nc))) x <- x
+  else stop(sprintf("'%s' must be scalar, length %d, or a %d by %d matrix.",
+                    name, nc, nr, nc), call. = FALSE)
+  if (anyNA(x) || any(!is.finite(x)) || any(x < 1)) {
+    stop(sprintf("Every '%s' entry must be finite and at least one.", name),
+         call. = FALSE)
+  }
+  x
+}
+
+.ash_hmm_dirichlet_penalty <- function(probability, alpha, active = NULL) {
+  if (is.null(active)) active <- matrix(TRUE, nrow(probability), ncol(probability))
+  use <- active & alpha > 1
+  if (!any(use)) return(0)
+  if (any(probability[use] <= 0)) return(-Inf)
+  sum((alpha[use] - 1) * log(probability[use]))
+}
+
+.ash_hmm_viterbi <- function(log_emission, A, init_prob, mask, sequence_id) {
+  n <- nrow(log_emission)
+  m <- ncol(log_emission)
+  log_A <- .ash_hmm_safe_log(A)
+  log_pi <- .ash_hmm_safe_log(init_prob)
+  edge <- which(mask, arr.ind = TRUE)
+  incoming <- lapply(seq_len(m), function(j) which(edge[, 2L] == j))
+  segments <- .ash_hmm_segments(sequence_id)
+  path <- integer(n)
+  
+  for (segment in seq_along(segments$starts)) {
+    first <- segments$starts[segment]
+    last <- segments$ends[segment]
+    delta <- matrix(-Inf, last - first + 1L, m)
+    back <- matrix(NA_integer_, last - first + 1L, m)
+    delta[1L, ] <- log_pi + log_emission[first, ]
+    if (first < last) {
+      for (tt in 2L:(last - first + 1L)) {
+        for (state in seq_len(m)) {
+          e <- incoming[[state]]
+          from <- edge[e, 1L]
+          values <- delta[tt - 1L, from] + log_A[cbind(from, rep(state, length(from)))]
+          winner <- which.max(values)
+          delta[tt, state] <- log_emission[first + tt - 1L, state] + values[winner]
+          back[tt, state] <- from[winner]
+        }
+      }
+    }
+    path[last] <- which.max(delta[nrow(delta), ])
+    if (first < last) {
+      for (t in last:(first + 1L)) {
+        path[t - 1L] <- back[t - first + 1L, path[t]]
+      }
+    }
+  }
+  path
+}
+
+.ash_hmm_posterior_summary <- function(y, se, mu, prior_sd, rho,
+                                       log_emission, gamma) {
+  n <- length(y)
+  m <- length(mu)
+  l <- length(prior_sd)
+  posterior_mean <- posterior_second <- prob_ge_zero <- prob_le_zero <-
+    prob_zero <- numeric(n)
+  log_rho <- .ash_hmm_safe_log(rho)
+  
+  for (state in seq_len(m)) {
+    terms <- matrix(-Inf, n, l)
+    for (component in seq_len(l)) {
+      terms[, component] <- log_rho[state, component] +
+        stats::dnorm(y, mean = mu[state],
+                     sd = sqrt(se^2 + prior_sd[component]^2), log = TRUE)
+    }
+    component_probability <- exp(terms - log_emission[, state])
+    state_mean <- state_second <- state_ge <- state_le <- state_zero <- numeric(n)
+    
+    for (component in seq_len(l)) {
+      tau <- prior_sd[component]
+      if (tau == 0) {
+        component_mean <- rep(mu[state], n)
+        component_variance <- rep(0, n)
+        ge <- rep(as.numeric(mu[state] >= 0), n)
+        le <- rep(as.numeric(mu[state] <= 0), n)
+        p0 <- rep(as.numeric(mu[state] == 0), n)
+      } else {
+        component_variance <- tau^2 * se^2 / (tau^2 + se^2)
+        component_mean <- (se^2 * mu[state] + tau^2 * y) / (tau^2 + se^2)
+        component_sd <- sqrt(component_variance)
+        ge <- stats::pnorm(component_mean / component_sd)
+        le <- stats::pnorm(-component_mean / component_sd)
+        p0 <- rep(0, n)
+      }
+      w <- component_probability[, component]
+      state_mean <- state_mean + w * component_mean
+      state_second <- state_second + w * (component_variance + component_mean^2)
+      state_ge <- state_ge + w * ge
+      state_le <- state_le + w * le
+      state_zero <- state_zero + w * p0
+    }
+    
+    g <- gamma[, state]
+    posterior_mean <- posterior_mean + g * state_mean
+    posterior_second <- posterior_second + g * state_second
+    prob_ge_zero <- prob_ge_zero + g * state_ge
+    prob_le_zero <- prob_le_zero + g * state_le
+    prob_zero <- prob_zero + g * state_zero
+  }
+  
+  posterior_variance <- pmax(0, posterior_second - posterior_mean^2)
+  list(mean = posterior_mean,
+       sd = sqrt(posterior_variance),
+       probability_ge_zero = pmin(1, pmax(0, prob_ge_zero)),
+       probability_le_zero = pmin(1, pmax(0, prob_le_zero)),
+       probability_zero = pmin(1, pmax(0, prob_zero)),
+       lfsr = pmin(prob_ge_zero, prob_le_zero))
+}
+
+.ash_hmm_posterior_summary_ashr <- function(y, mu, gamma, ash_fit,
+                                            pointmass) {
+  n <- length(y)
+  m <- length(mu)
+  posterior_mean <- posterior_second <- probability_positive <-
+    probability_negative <- probability_zero <- numeric(n)
+  
+  for (state in seq_len(m)) {
+    if (pointmass[state] || is.null(ash_fit[[state]])) {
+      state_mean <- rep(mu[state], n)
+      state_sd <- numeric(n)
+      state_positive <- rep(as.numeric(mu[state] > 0), n)
+      state_negative <- rep(as.numeric(mu[state] < 0), n)
+      state_zero <- rep(as.numeric(mu[state] == 0), n)
+    } else {
+      state_mean <- as.numeric(ashr::get_pm(ash_fit[[state]]))
+      state_sd <- as.numeric(ashr::get_psd(ash_fit[[state]]))
+      state_positive <- as.numeric(ashr::get_pp(ash_fit[[state]]))
+      state_negative <- as.numeric(ashr::get_np(ash_fit[[state]]))
+      # With normal components, exact mass at beta=0 is possible only for a
+      # state whose point component is centered at zero.
+      state_zero <- if (mu[state] == 0) {
+        as.numeric(ashr::get_lfdr(ash_fit[[state]]))
+      } else numeric(n)
+    }
+    if (any(lengths(list(state_mean, state_sd, state_positive,
+                         state_negative, state_zero)) != n)) {
+      stop("ashr returned posterior summaries with an invalid length.",
+           call. = FALSE)
+    }
+    weight <- gamma[, state]
+    posterior_mean <- posterior_mean + weight * state_mean
+    posterior_second <- posterior_second +
+      weight * (state_sd^2 + state_mean^2)
+    probability_positive <- probability_positive + weight * state_positive
+    probability_negative <- probability_negative + weight * state_negative
+    probability_zero <- probability_zero + weight * state_zero
+  }
+  
+  posterior_variance <- pmax(0, posterior_second - posterior_mean^2)
+  probability_ge_zero <- 1 - probability_negative
+  probability_le_zero <- 1 - probability_positive
+  list(mean = posterior_mean,
+       sd = sqrt(posterior_variance),
+       probability_ge_zero = pmin(1, pmax(0, probability_ge_zero)),
+       probability_le_zero = pmin(1, pmax(0, probability_le_zero)),
+       probability_zero = pmin(1, pmax(0, probability_zero)),
+       lfsr = pmin(probability_ge_zero, probability_le_zero))
+}
+
+# Fit the general ash-HMM by a coherent EM/Baum-Welch algorithm.
+fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
+                        half_grid = 100L,
+                        grid_shape = 1.5,
+                        grid_expansion = 1.5,
+                        grid_max_abs = NULL,
+                        prefilter = NULL,
+                        min_state_count = 2,
+                        min_state_fraction = 1e-5,
+                        screening_prior_sd = 0,
+                        screening_block_size = 5000L,
+                        sequence_id = rep(1L, length(y)),
+                        topology = c("hub", "full"),
+                        transition_mask = NULL,
+                        init_transition = NULL,
+                        init_prob = NULL,
+                        init_rho = NULL,
+                        stay_probability = 0.95,
+                        fixed_pointmass_states = 1L,
+                        shared_mixture = FALSE,
+                        mixture_engine = c("ashr", "native"),
+                        ash_min_effective_count = 2,
+                        ash_prior = "nullbiased",
+                        ash_nullweight = 10,
+                        ash_control = list(),
+                        ash_pi_thresh = 1e-10,
+                        estimate_init = FALSE,
+                        transition_prior = 1,
+                        mixture_prior = 1,
+                        init_prior = 1,
+                        maxiter = 200L,
+                        tolerance = 1e-8,
+                        verbose = FALSE) {
+  call <- match.call()
+  topology <- match.arg(topology)
+  mixture_engine <- match.arg(mixture_engine)
+  .ash_hmm_check_data(y, se, sequence_id)
+  
+  automatic_mu <- is.null(mu)
+  if (is.null(prefilter)) prefilter <- automatic_mu
+  if (!is.logical(prefilter) || length(prefilter) != 1L || is.na(prefilter)) {
+    stop("'prefilter' must be TRUE or FALSE.", call. = FALSE)
+  }
+  if (automatic_mu && (!is.null(transition_mask) || !is.null(init_transition) ||
+                       !is.null(init_prob) || !is.null(init_rho))) {
+    stop(paste("Supply 'mu' explicitly when using a custom transition mask,",
+               "initial transition matrix, initial probabilities, or ash weights."),
+         call. = FALSE)
+  }
+  
+  if (automatic_mu) {
+    if (prefilter) {
+      grid_selection <- ash_hmm_select_grid(
+        y, se,
+        half_grid = half_grid,
+        shape = grid_shape,
+        expansion = grid_expansion,
+        max_abs = grid_max_abs,
+        min_state_count = min_state_count,
+        min_state_fraction = min_state_fraction,
+        screening_prior_sd = screening_prior_sd,
+        block_size = screening_block_size)
+      mu <- grid_selection$selected_mu
+    } else {
+      mu <- ash_mu_grid(y, half_grid = half_grid, shape = grid_shape,
+                        expansion = grid_expansion, max_abs = grid_max_abs)
+      grid_selection <- list(
+        automatic = TRUE,
+        full_mu = mu,
+        selected_mu = mu,
+        selected_index = seq_along(mu),
+        removed_index = integer(),
+        effective_count = rep(NA_real_, length(mu)),
+        mean_weight = rep(NA_real_, length(mu)),
+        cutoff = NA_real_,
+        settings = list(prefilter = FALSE))
+    }
+  } else {
+    if (!is.numeric(mu) || !length(mu) || anyNA(mu) || any(!is.finite(mu))) {
+      stop("'mu' must be a finite numeric vector.", call. = FALSE)
+    }
+    if (prefilter) {
+      if (!is.null(transition_mask) || !is.null(init_transition) ||
+          !is.null(init_prob) || !is.null(init_rho)) {
+        stop("Prefilter a supplied grid before providing state-sized initial values.",
+             call. = FALSE)
+      }
+      grid_selection <- .ash_hmm_prefilter_mu(
+        y, se, mu,
+        min_state_count = min_state_count,
+        min_state_fraction = min_state_fraction,
+        screening_prior_sd = screening_prior_sd,
+        block_size = screening_block_size)
+      grid_selection$automatic <- FALSE
+      mu <- grid_selection$selected_mu
+    } else {
+      grid_selection <- list(
+        automatic = FALSE,
+        full_mu = mu,
+        selected_mu = mu,
+        selected_index = seq_along(mu),
+        removed_index = integer(),
+        effective_count = rep(NA_real_, length(mu)),
+        mean_weight = rep(NA_real_, length(mu)),
+        cutoff = NA_real_,
+        settings = list(prefilter = FALSE))
+    }
+  }
+  
+  if (mu[1L] != 0) {
+    warning("The hub state is state 1, but mu[1] is not zero.")
+  }
+  automatic_prior_sd <- is.null(prior_sd)
+  if (automatic_prior_sd) prior_sd <- ash_sigma_grid(y, se)
+  if (!is.numeric(prior_sd) || !length(prior_sd) || anyNA(prior_sd) ||
+      any(!is.finite(prior_sd)) || any(prior_sd < 0) || prior_sd[1L] != 0) {
+    stop("'prior_sd' must be finite, nonnegative, and start with zero.", call. = FALSE)
+  }
+  if (is.unsorted(prior_sd, strictly = FALSE)) {
+    stop("'prior_sd' must be sorted in nondecreasing order.", call. = FALSE)
+  }
+  
+  n <- length(y)
+  m <- length(mu)
+  l <- length(prior_sd)
+  maxiter <- as.integer(maxiter)
+  if (maxiter < 1L || tolerance <= 0) {
+    stop("Require maxiter >= 1 and tolerance > 0.", call. = FALSE)
+  }
+  if (verbose && automatic_mu) {
+    message(sprintf("automatic mean grid: retained %d of %d states before HMM fitting",
+                    length(mu), length(grid_selection$full_mu)))
+  }
+  fixed_pointmass_states <- sort(unique(as.integer(fixed_pointmass_states)))
+  if (any(fixed_pointmass_states < 1L | fixed_pointmass_states > m)) {
+    stop("'fixed_pointmass_states' contains an invalid state index.", call. = FALSE)
+  }
+  if (!is.logical(shared_mixture) || length(shared_mixture) != 1L ||
+      is.na(shared_mixture)) {
+    stop("'shared_mixture' must be TRUE or FALSE.", call. = FALSE)
+  }
+  if (mixture_engine == "ashr") {
+    if (shared_mixture) {
+      stop(paste0("The ashr engine learns one prior per state and therefore ",
+                  "requires shared_mixture = FALSE. Use mixture_engine = ",
+                  "\"native\" for a shared mixture."), call. = FALSE)
+    }
+    if (!is.null(init_rho)) {
+      stop("'init_rho' is supported only by mixture_engine = \"native\".",
+           call. = FALSE)
+    }
+    if (length(ash_min_effective_count) != 1L ||
+        !is.finite(ash_min_effective_count) || ash_min_effective_count < 0) {
+      stop("'ash_min_effective_count' must be a nonnegative scalar.",
+           call. = FALSE)
+    }
+    if (is.character(ash_prior)) {
+      if (length(ash_prior) != 1L ||
+          !ash_prior %in% c("nullbiased", "uniform")) {
+        stop("Character 'ash_prior' must be \"nullbiased\" or \"uniform\".",
+             call. = FALSE)
+      }
+    } else if (!is.numeric(ash_prior) || !length(ash_prior) ||
+               anyNA(ash_prior) || any(!is.finite(ash_prior)) ||
+               any(ash_prior < 1)) {
+      stop("Numeric 'ash_prior' entries must be finite and at least one.",
+           call. = FALSE)
+    }
+    if (length(ash_nullweight) != 1L || !is.finite(ash_nullweight) ||
+        ash_nullweight < 1 || !is.list(ash_control) ||
+        length(ash_pi_thresh) != 1L || !is.finite(ash_pi_thresh) ||
+        ash_pi_thresh < 0) {
+      stop("Invalid ashr prior, control, or pruning settings.", call. = FALSE)
+    }
+  }
+  
+  if (is.null(transition_mask)) {
+    transition_mask <- ash_hmm_transition_mask(m, topology)
+  } else {
+    if (!is.matrix(transition_mask) || any(dim(transition_mask) != c(m, m))) {
+      stop("'transition_mask' must be an M by M matrix.", call. = FALSE)
+    }
+    transition_mask <- transition_mask != 0
+    if (any(rowSums(transition_mask) == 0)) {
+      stop("Every state needs at least one allowed outgoing transition.", call. = FALSE)
+    }
+  }
+  
+  if (is.null(init_transition)) {
+    A <- .ash_hmm_initial_transition(transition_mask, stay_probability)
+  } else {
+    A <- .ash_hmm_validate_transition(init_transition, transition_mask)
+  }
+  
+  if (is.null(init_prob)) init_prob <- .ash_hmm_stationary(A)
+  if (!is.numeric(init_prob) || length(init_prob) != m || anyNA(init_prob) ||
+      any(!is.finite(init_prob)) || any(init_prob < 0) || sum(init_prob) <= 0) {
+    stop("'init_prob' must be a nonnegative length-M vector with positive mass.", call. = FALSE)
+  }
+  init_prob <- .ash_hmm_normalize(init_prob)
+  
+  if (is.null(init_rho)) {
+    rho <- matrix(1 / l, m, l)
+  } else {
+    if (!is.matrix(init_rho) || any(dim(init_rho) != c(m, l)) ||
+        anyNA(init_rho) || any(!is.finite(init_rho)) || any(init_rho < 0) ||
+        any(rowSums(init_rho) <= 0)) {
+      stop("'init_rho' must be a nonnegative M by L matrix with positive row sums.",
+           call. = FALSE)
+    }
+    rho <- init_rho / rowSums(init_rho)
+  }
+  if (length(fixed_pointmass_states)) {
+    rho[fixed_pointmass_states, ] <- 0
+    rho[fixed_pointmass_states, 1L] <- 1
+  }
+  
+  transition_prior <- .ash_hmm_expand_prior(transition_prior, m, m,
+                                            "transition_prior")
+  mixture_prior <- .ash_hmm_expand_prior(mixture_prior, m, l, "mixture_prior")
+  if (mixture_engine == "ashr" && any(mixture_prior != 1)) {
+    stop(paste0("'mixture_prior' belongs to the native engine; use ",
+                "'ash_prior' and 'ash_nullweight' with the ashr engine."),
+         call. = FALSE)
+  }
+  init_prior <- rep(init_prior, length.out = m)
+  if (anyNA(init_prior) || any(!is.finite(init_prior)) || any(init_prior < 1)) {
+    stop("Every 'init_prior' entry must be finite and at least one.", call. = FALSE)
+  }
+  
+  mixture_active <- matrix(TRUE, m, l)
+  if (length(fixed_pointmass_states)) {
+    mixture_active[fixed_pointmass_states, ] <- FALSE
+  }
+  
+  objective_value <- function(log_likelihood, A, rho, init_prob,
+                              ash_fit = NULL, ash_pointmass = NULL) {
+    ans <- log_likelihood +
+      .ash_hmm_dirichlet_penalty(A, transition_prior, transition_mask)
+    if (mixture_engine == "native") {
+      ans <- ans +
+        .ash_hmm_dirichlet_penalty(rho, mixture_prior, mixture_active)
+    } else {
+      ans <- ans + .ash_hmm_ash_penalty(
+        ash_fit, ash_pointmass, ash_prior, ash_nullweight)
+    }
+    if (estimate_init) {
+      use <- init_prior > 1
+      if (any(use)) {
+        if (any(init_prob[use] <= 0)) return(-Inf)
+        ans <- ans + sum((init_prior[use] - 1) * log(init_prob[use]))
+      }
+    }
+    ans
+  }
+  
+  free_states <- setdiff(seq_len(m), fixed_pointmass_states)
+  ash_fit <- vector("list", m)
+  ash_pointmass <- seq_len(m) %in% fixed_pointmass_states
+  ash_effective_count <- rep(NA_real_, m)
+  ash_failed_states <- integer()
+  
+  # Point emissions, as in the original implementation, provide a sharp and
+  # interpretable first state allocation for the separate weighted ash fits.
+  # This is an initialization pass only; all later passes use the fitted ash
+  # priors from one coherent parameter snapshot.
+  rho_initial <- rho
+  if (mixture_engine == "ashr") {
+    rho_initial[,] <- 0
+    rho_initial[, 1L] <- 1
+  }
+  log_emission <- .ash_hmm_log_emission(
+    y, se, mu, prior_sd, rho_initial)
+  fb <- .ash_hmm_forward_backward(log_emission, A, init_prob,
+                                  transition_mask, sequence_id)
+  if (mixture_engine == "ashr") {
+    if (length(free_states)) {
+      ash_initial <- .ash_hmm_fit_ash_states(
+        y, se, mu, prior_sd, fb$state_probability,
+        fixed_pointmass_states = fixed_pointmass_states,
+        min_effective_count = ash_min_effective_count,
+        prior = ash_prior, nullweight = ash_nullweight,
+        control = ash_control, pi_thresh = ash_pi_thresh,
+        verbose = verbose)
+      ash_fit <- ash_initial$fit
+      ash_pointmass <- ash_initial$pointmass
+      ash_effective_count <- ash_initial$effective_count
+      ash_failed_states <- ash_initial$failed
+    } else {
+      ash_pointmass[] <- TRUE
+      ash_effective_count <- colSums(fb$state_probability)
+    }
+    rho <- .ash_hmm_ash_weight_matrix(ash_fit, ash_pointmass, prior_sd)
+    log_emission <- .ash_hmm_log_emission_ashr(
+      y, se, mu, ash_fit, ash_pointmass)
+    fb <- .ash_hmm_forward_backward(log_emission, A, init_prob,
+                                    transition_mask, sequence_id)
+  }
+  objective <- objective_value(fb$log_likelihood, A, rho, init_prob,
+                               ash_fit, ash_pointmass)
+  history <- data.frame(iteration = 0L,
+                        log_likelihood = fb$log_likelihood,
+                        objective = objective)
+  converged <- FALSE
+  
+  for (iter in seq_len(maxiter)) {
+    rho_new <- rho
+    ash_fit_new <- ash_fit
+    ash_pointmass_new <- ash_pointmass
+    ash_effective_count_new <- ash_effective_count
+    ash_failed_states_new <- integer()
+    
+    if (mixture_engine == "native") {
+      component_counts <- .ash_hmm_component_counts(
+        y, se, mu, prior_sd, rho, log_emission, fb$state_probability)
+      if (length(free_states)) {
+        if (shared_mixture) {
+          numerator <- colSums(component_counts[free_states, , drop = FALSE]) +
+            colSums(mixture_prior[free_states, , drop = FALSE] - 1)
+          common <- .ash_hmm_normalize(
+            numerator,
+            fallback = colMeans(rho[free_states, , drop = FALSE]))
+          rho_new[free_states, ] <- matrix(
+            rep(common, each = length(free_states)), length(free_states), l)
+        } else {
+          for (state in free_states) {
+            numerator <- component_counts[state, ] +
+              mixture_prior[state, ] - 1
+            rho_new[state, ] <- .ash_hmm_normalize(
+              numerator, fallback = rho[state, ])
+          }
+        }
+      }
+      if (length(fixed_pointmass_states)) {
+        rho_new[fixed_pointmass_states, ] <- 0
+        rho_new[fixed_pointmass_states, 1L] <- 1
+      }
+    } else if (length(free_states)) {
+      ash_update <- .ash_hmm_fit_ash_states(
+        y, se, mu, prior_sd, fb$state_probability,
+        fixed_pointmass_states = fixed_pointmass_states,
+        previous_fit = ash_fit,
+        previous_pointmass = ash_pointmass,
+        min_effective_count = ash_min_effective_count,
+        prior = ash_prior, nullweight = ash_nullweight,
+        control = ash_control, pi_thresh = ash_pi_thresh,
+        verbose = verbose)
+      ash_fit_new <- ash_update$fit
+      ash_pointmass_new <- ash_update$pointmass
+      ash_effective_count_new <- ash_update$effective_count
+      ash_failed_states_new <- ash_update$failed
+      rho_new <- .ash_hmm_ash_weight_matrix(
+        ash_fit_new, ash_pointmass_new, prior_sd)
+    }
+    
+    A_new <- matrix(0, m, m)
+    for (state in seq_len(m)) {
+      allowed <- which(transition_mask[state, ])
+      numerator <- fb$transition_counts[state, allowed] +
+        transition_prior[state, allowed] - 1
+      A_new[state, allowed] <- .ash_hmm_normalize(
+        numerator, fallback = A[state, allowed])
+    }
+    
+    init_prob_new <- init_prob
+    if (estimate_init) {
+      numerator <- fb$initial_counts + init_prior - 1
+      init_prob_new <- .ash_hmm_normalize(numerator, fallback = init_prob)
+    }
+    
+    log_emission_new <- if (mixture_engine == "native") {
+      .ash_hmm_log_emission(y, se, mu, prior_sd, rho_new)
+    } else {
+      .ash_hmm_log_emission_ashr(
+        y, se, mu, ash_fit_new, ash_pointmass_new)
+    }
+    fb_new <- .ash_hmm_forward_backward(log_emission_new, A_new, init_prob_new,
+                                        transition_mask, sequence_id)
+    objective_new <- objective_value(fb_new$log_likelihood, A_new, rho_new,
+                                     init_prob_new, ash_fit_new,
+                                     ash_pointmass_new)
+    history <- rbind(history,
+                     data.frame(iteration = iter,
+                                log_likelihood = fb_new$log_likelihood,
+                                objective = objective_new))
+    
+    if (verbose) {
+      message(sprintf("iteration %d: logLik = %.10f, objective = %.10f",
+                      iter, fb_new$log_likelihood, objective_new))
+    }
+    if (is.finite(objective_new) && is.finite(objective) &&
+        objective_new < objective - 1e-7 * (1 + abs(objective))) {
+      warning("The EM objective decreased beyond numerical tolerance.")
+    }
+    
+    delta <- objective_new - objective
+    A <- A_new
+    rho <- rho_new
+    ash_fit <- ash_fit_new
+    ash_pointmass <- ash_pointmass_new
+    ash_effective_count <- ash_effective_count_new
+    ash_failed_states <- sort(unique(c(ash_failed_states,
+                                       ash_failed_states_new)))
+    init_prob <- init_prob_new
+    log_emission <- log_emission_new
+    fb <- fb_new
+    objective <- objective_new
+    
+    if (is.finite(delta) &&
+        abs(delta) <= tolerance * (1 + abs(objective))) {
+      converged <- TRUE
+      break
+    }
+  }
+  
+  posterior <- if (mixture_engine == "native") {
+    .ash_hmm_posterior_summary(
+      y, se, mu, prior_sd, rho, log_emission, fb$state_probability)
+  } else {
+    .ash_hmm_posterior_summary_ashr(
+      y, mu, fb$state_probability, ash_fit, ash_pointmass)
+  }
+  viterbi_state <- .ash_hmm_viterbi(log_emission, A, init_prob,
+                                    transition_mask, sequence_id)
+  log_null <- sum(stats::dnorm(y, mean = 0, sd = se, log = TRUE))
+  
+  ans <- list(call = call,
+              state_probability = fb$state_probability,
+              posterior = posterior,
+              viterbi_state = viterbi_state,
+              boundary_probability = fb$boundary_probability,
+              fitted = list(mu = mu,
+                            prior_sd = prior_sd,
+                            mixture_weight = rho,
+                            transition = A,
+                            transition_mask = transition_mask,
+                            init_prob = init_prob,
+                            mixture_engine = mixture_engine,
+                            shared_mixture = shared_mixture,
+                            fixed_pointmass_states = fixed_pointmass_states,
+                            pointmass_states = which(ash_pointmass),
+                            state_effective_count = if (mixture_engine == "ashr")
+                              colSums(fb$state_probability) else NULL,
+                            state_prior = if (mixture_engine == "ashr")
+                              lapply(ash_fit, function(x) {
+                                if (is.null(x)) NULL else ashr::get_fitted_g(x)
+                              }) else NULL,
+                            ash_failed_states = if (mixture_engine == "ashr")
+                              ash_failed_states else integer()),
+              grid = c(grid_selection,
+                       list(automatic_prior_sd = automatic_prior_sd,
+                            selected_prior_sd = prior_sd)),
+              log_likelihood = fb$log_likelihood,
+              log_null = log_null,
+              log_evidence_ratio = fb$log_likelihood - log_null,
+              # Compatibility aliases used by the original fit_hmm output.
+              prob = fb$state_probability,
+              x_post = posterior$mean,
+              lfsr = posterior$lfsr,
+              mu = mu,
+              ll_hmm = fb$log_likelihood,
+              ll_null = log_null,
+              log_BF = fb$log_likelihood - log_null,
+              history = history,
+              converged = converged,
+              iterations = nrow(history) - 1L)
+  class(ans) <- "ash_hmm_fit"
+  ans
+}
+
+print.ash_hmm_fit <- function(x, ...) {
+  cat("Adaptive-shrinkage HMM fit\n")
+  cat("  observations:", nrow(x$state_probability), "\n")
+  cat("  states:", ncol(x$state_probability))
+  if (isTRUE(x$grid$automatic)) {
+    cat(" (retained from", length(x$grid$full_mu), "automatic candidates)")
+  }
+  cat("\n")
+  cat("  mixture engine:", x$fitted$mixture_engine, "\n")
+  cat("  iterations:", x$iterations,
+      if (x$converged) "(converged)" else "(maximum reached)", "\n")
+  cat("  log likelihood:", format(x$log_likelihood, digits = 8), "\n")
+  invisible(x)
+}
+
+# Backward-compatible two-input entry point matching the original function.
+# The old halfK/mult names map to the automatic mean-grid controls.
+fit_hmm <- function(x, sd, halfK = NULL, mult = NULL, ...) {
+  arguments <- list(...)
+  if (!is.null(halfK)) {
+    if (!is.null(arguments$half_grid)) {
+      stop("Supply only one of 'halfK' and 'half_grid'.", call. = FALSE)
+    }
+    arguments$half_grid <- halfK
+  }
+  if (!is.null(mult)) {
+    if (!is.null(arguments$grid_shape)) {
+      stop("Supply only one of 'mult' and 'grid_shape'.", call. = FALSE)
+    }
+    arguments$grid_shape <- mult
+  }
+  do.call(fit_ash_hmm, c(list(y = x, se = sd), arguments))
+}
+
+# Exact two-state reduction used in the supplied binary-Markov paper.
+# The state means are point masses and A(q) has one symmetric flip parameter.
+fit_binary_markov <- function(y, se, state_means = c(0, 1),
+                              sequence_id = rep(1L, length(y)),
+                              q_interval = c(0, 0.5),
+                              grid_size = 501L,
+                              init_prob = c(0.5, 0.5)) {
+  .ash_hmm_check_data(y, se, sequence_id)
+  if (!is.numeric(state_means) || length(state_means) != 2L ||
+      anyNA(state_means) || any(!is.finite(state_means))) {
+    stop("'state_means' must contain two finite values.", call. = FALSE)
+  }
+  if (length(q_interval) != 2L || q_interval[1L] < 0 ||
+      q_interval[2L] > 1 || q_interval[1L] >= q_interval[2L]) {
+    stop("'q_interval' must be an increasing subinterval of [0, 1].",
+         call. = FALSE)
+  }
+  if (!is.numeric(init_prob) || length(init_prob) != 2L || anyNA(init_prob) ||
+      any(!is.finite(init_prob)) || any(init_prob < 0) || sum(init_prob) <= 0) {
+    stop("'init_prob' must be a nonnegative length-two vector with positive mass.",
+         call. = FALSE)
+  }
+  grid_size <- as.integer(grid_size)
+  if (grid_size < 5L) stop("'grid_size' must be at least five.", call. = FALSE)
+  init_prob <- .ash_hmm_normalize(init_prob)
+  mask <- matrix(TRUE, 2L, 2L)
+  log_emission <- cbind(
+    stats::dnorm(y, state_means[1L], se, log = TRUE),
+    stats::dnorm(y, state_means[2L], se, log = TRUE))
+  
+  evaluate <- function(q, details = FALSE) {
+    A <- matrix(c(1 - q, q, q, 1 - q), 2L, 2L, byrow = TRUE)
+    fb <- .ash_hmm_forward_backward(log_emission, A, init_prob, mask, sequence_id)
+    if (details) return(list(A = A, fb = fb))
+    fb$log_likelihood
+  }
+  
+  grid <- seq(q_interval[1L], q_interval[2L], length.out = grid_size)
+  values <- vapply(grid, evaluate, numeric(1L))
+  local <- which(values[2L:(grid_size - 1L)] >= values[1L:(grid_size - 2L)] &
+                   values[2L:(grid_size - 1L)] >= values[3L:grid_size]) + 1L
+  candidates <- data.frame(q = c(grid[1L], grid[grid_size]),
+                           log_likelihood = c(values[1L], values[grid_size]))
+  if (length(local)) {
+    for (i in local) {
+      refined <- stats::optimize(function(q) -evaluate(q),
+                                 interval = c(grid[i - 1L], grid[i + 1L]))
+      candidates <- rbind(candidates,
+                          data.frame(q = refined$minimum,
+                                     log_likelihood = -refined$objective))
+    }
+  }
+  best <- candidates[which.max(candidates$log_likelihood), ]
+  details <- evaluate(best$q, details = TRUE)
+  viterbi <- .ash_hmm_viterbi(log_emission, details$A, init_prob, mask, sequence_id)
+  
+  list(q = best$q,
+       expected_run_length = if (best$q > 0) 1 / best$q else Inf,
+       state_probability = details$fb$state_probability,
+       boundary_probability = details$fb$boundary_probability,
+       viterbi_state = viterbi,
+       transition = details$A,
+       init_prob = init_prob,
+       log_likelihood = details$fb$log_likelihood,
+       search = list(grid = grid, values = values, candidates = candidates))
+}

@@ -1,16 +1,8 @@
-# ash_hmm.R
-#
-# A dependency-free implementation of an adaptive-shrinkage hidden Markov
-# model for heteroskedastic normal observations.
-#
-# Model:
-#   y_t | beta_t ~ N(beta_t, se_t^2)
-#   Q_t is a finite-state Markov chain with transition matrix A
-#   beta_t | Q_t=m ~ sum_l rho[m,l] N(mu[m], prior_sd[l]^2)
-#
-# prior_sd[1] must be zero, so the first component is a point mass at mu[m].
-# The means and prior standard deviations are fixed; A, rho, and optionally
-# the initial state distribution are estimated by EM.
+.ash_hmm_version <- "1.2.0-native-learned-means"
+
+#' Return the implementation version.
+#' @export
+ash_hmm_version <- function() .ash_hmm_version
 
 .ash_hmm_logsumexp <- function(x) {
   if (!length(x)) return(-Inf)
@@ -81,7 +73,7 @@ ash_sigma_grid <- function(y, se, multiplier = sqrt(2), sigma_min = NULL,
 }
 
 # Symmetric state-mean grid with the zero/hub state first.
-ash_mu_grid <- function(y, half_grid = 25L, shape = 3, expansion = 1.5,
+ash_mu_grid <- function(y, half_grid = 100L, shape = 3, expansion = 1.5,
                         max_abs = NULL) {
   if (!is.numeric(y) || !length(y) || anyNA(y) || any(!is.finite(y))) {
     stop("'y' must be a finite numeric vector.", call. = FALSE)
@@ -96,12 +88,101 @@ ash_mu_grid <- function(y, half_grid = 25L, shape = 3, expansion = 1.5,
   c(positive, -positive[-1L])
 }
 
+# Screen a candidate state-mean grid before any HMM forward-backward pass.
+# Each observation is assigned soft iid weights under point emissions centered
+# on the candidate means. Their column sums are effective observation counts.
+.ash_hmm_prefilter_mu <- function(y, se, mu,
+                                  min_state_count = 0.5,
+                                  min_state_fraction = 1e-5,
+                                  screening_prior_sd = 0,
+                                  block_size = 5000L) {
+  if (!is.numeric(mu) || !length(mu) || anyNA(mu) || any(!is.finite(mu))) {
+    stop("'mu' must be a finite numeric vector.", call. = FALSE)
+  }
+  if (length(min_state_count) != 1L || !is.finite(min_state_count) ||
+      min_state_count < 0 || length(min_state_fraction) != 1L ||
+      !is.finite(min_state_fraction) || min_state_fraction < 0 ||
+      min_state_fraction > 1) {
+    stop("Grid-screening count and fraction thresholds must be valid scalars.",
+         call. = FALSE)
+  }
+  if (length(screening_prior_sd) != 1L || !is.finite(screening_prior_sd) ||
+      screening_prior_sd < 0) {
+    stop("'screening_prior_sd' must be a finite nonnegative scalar.",
+         call. = FALSE)
+  }
+  block_size <- as.integer(block_size)
+  if (block_size < 1L) stop("'block_size' must be positive.", call. = FALSE)
+
+  n <- length(y)
+  m <- length(mu)
+  effective_count <- numeric(m)
+  starts <- seq.int(1L, n, by = block_size)
+
+  for (first in starts) {
+    last <- min(n, first + block_size - 1L)
+    index <- first:last
+    log_score <- matrix(-Inf, length(index), m)
+    for (state in seq_len(m)) {
+      log_score[, state] <- stats::dnorm(
+        y[index], mean = mu[state],
+        sd = sqrt(se[index]^2 + screening_prior_sd^2), log = TRUE)
+    }
+    log_normalizer <- .ash_hmm_row_logsumexp(log_score)
+    effective_count <- effective_count +
+      colSums(exp(log_score - log_normalizer))
+  }
+
+  cutoff <- max(min_state_count, n * min_state_fraction)
+  keep <- which(effective_count >= cutoff)
+  # State 1 is the zero/hub state for automatically constructed grids and is
+  # retained even when the data are entirely nonzero.
+  keep <- sort(unique(c(1L, keep)))
+
+  list(full_mu = mu,
+       selected_mu = mu[keep],
+       selected_index = keep,
+       removed_index = setdiff(seq_len(m), keep),
+       effective_count = effective_count,
+       mean_weight = effective_count / n,
+       cutoff = cutoff,
+       settings = list(min_state_count = min_state_count,
+                       min_state_fraction = min_state_fraction,
+                       screening_prior_sd = screening_prior_sd,
+                       block_size = block_size))
+}
+
+# Construct the original symmetric power grid and remove unsupported states
+# before fitting the HMM. This is also useful for inspecting the automatic
+# choice without fitting a model.
+ash_hmm_select_grid <- function(y, se,
+                                half_grid = 100L,
+                                shape = 3,
+                                expansion = 1.5,
+                                max_abs = NULL,
+                                min_state_count = 0.5,
+                                min_state_fraction = 1e-5,
+                                screening_prior_sd = 0,
+                                block_size = 5000L) {
+  .ash_hmm_check_data(y, se, rep(1L, length(y)))
+  candidate <- ash_mu_grid(y, half_grid = half_grid, shape = shape,
+                           expansion = expansion, max_abs = max_abs)
+  ans <- .ash_hmm_prefilter_mu(
+    y, se, candidate,
+    min_state_count = min_state_count,
+    min_state_fraction = min_state_fraction,
+    screening_prior_sd = screening_prior_sd,
+    block_size = block_size)
+  ans$automatic <- TRUE
+  ans
+}
+
 ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
   topology <- match.arg(topology)
   n_states <- as.integer(n_states)
   if (n_states < 1L) stop("'n_states' must be positive.", call. = FALSE)
   if (topology == "full") return(matrix(TRUE, n_states, n_states))
-  
+
   # Hub-and-spoke: the zero/hub state is state 1. A non-hub state may
   # persist or return to the hub, but may not jump directly to another spoke.
   mask <- diag(TRUE, n_states)
@@ -194,19 +275,19 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
   incoming <- lapply(seq_len(m), function(j) which(edge_to == j))
   outgoing <- lapply(seq_len(m), function(i) which(edge_from == i))
   segments <- .ash_hmm_segments(sequence_id)
-  
+
   log_alpha <- matrix(-Inf, n, m)
   log_beta <- matrix(-Inf, n, m)
   gamma <- matrix(0, n, m)
   transition_counts <- matrix(0, m, m)
   boundary_probability <- rep(NA_real_, max(0L, n - 1L))
   total_log_likelihood <- 0
-  
+
   for (segment in seq_along(segments$starts)) {
     first <- segments$starts[segment]
     last <- segments$ends[segment]
     log_alpha[first, ] <- log_pi + log_emission[first, ]
-    
+
     if (first < last) {
       for (t in (first + 1L):last) {
         for (state in seq_len(m)) {
@@ -217,14 +298,14 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
         }
       }
     }
-    
+
     segment_ll <- .ash_hmm_logsumexp(log_alpha[last, ])
     if (!is.finite(segment_ll)) {
       stop("The HMM assigns zero probability to an observed sequence.", call. = FALSE)
     }
     total_log_likelihood <- total_log_likelihood + segment_ll
     log_beta[last, ] <- 0
-    
+
     if (first < last) {
       for (t in (last - 1L):first) {
         for (state in seq_len(m)) {
@@ -236,13 +317,13 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
         }
       }
     }
-    
+
     for (t in first:last) {
       lg <- log_alpha[t, ] + log_beta[t, ] - segment_ll
       lg <- lg - .ash_hmm_logsumexp(lg)
       gamma[t, ] <- exp(lg)
     }
-    
+
     if (first < last) {
       for (t in first:(last - 1L)) {
         log_xi <- log_alpha[t, edge_from] +
@@ -259,7 +340,7 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
       }
     }
   }
-  
+
   list(log_likelihood = total_log_likelihood,
        state_probability = gamma,
        transition_counts = transition_counts,
@@ -268,12 +349,13 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
        starts = segments$starts)
 }
 
-.ash_hmm_component_counts <- function(y, se, mu, prior_sd, rho,
-                                      log_emission, gamma) {
+.ash_hmm_component_statistics <- function(y, se, mu, prior_sd, rho,
+                                           log_emission, gamma) {
   n <- length(y)
   m <- length(mu)
   l <- length(prior_sd)
   counts <- matrix(0, m, l)
+  mean_numerator <- mean_precision <- numeric(m)
   log_rho <- .ash_hmm_safe_log(rho)
   for (state in seq_len(m)) {
     terms <- matrix(-Inf, n, l)
@@ -283,9 +365,117 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
                      sd = sqrt(se^2 + prior_sd[component]^2), log = TRUE)
     }
     conditional <- exp(terms - log_emission[, state])
-    counts[state, ] <- colSums(conditional * gamma[, state])
+    joint <- conditional * gamma[, state]
+    counts[state, ] <- colSums(joint)
+    for (component in seq_len(l)) {
+      observation_variance <- se^2 + prior_sd[component]^2
+      mean_numerator[state] <- mean_numerator[state] +
+        sum(joint[, component] * y / observation_variance)
+      mean_precision[state] <- mean_precision[state] +
+        sum(joint[, component] / observation_variance)
+    }
   }
-  counts
+  list(counts = counts,
+       occupancy = rowSums(counts),
+       mean_numerator = mean_numerator,
+       mean_precision = mean_precision)
+}
+
+.ash_hmm_component_counts <- function(y, se, mu, prior_sd, rho,
+                                      log_emission, gamma) {
+  .ash_hmm_component_statistics(y, se, mu, prior_sd, rho,
+                                log_emission, gamma)$counts
+}
+
+# Nonoverlapping intervals around the current set of anchor centers. Restricting
+# each learned center to its own interval prevents label crossing and stops a
+# dense collection of states from collapsing onto the same plateau. When states
+# are pruned, recomputing these intervals automatically gives the survivors more
+# room to move.
+.ash_hmm_voronoi_bounds <- function(anchor) {
+  m <- length(anchor)
+  lower <- rep(-Inf, m)
+  upper <- rep(Inf, m)
+  if (m <= 1L) return(cbind(lower = lower, upper = upper))
+  if (anyDuplicated(anchor)) {
+    stop("State-center anchors must be distinct when using Voronoi bounds.",
+         call. = FALSE)
+  }
+  order_mu <- order(anchor)
+  sorted <- anchor[order_mu]
+  midpoint <- (sorted[-m] + sorted[-1L]) / 2
+  lower_sorted <- c(-Inf, midpoint)
+  upper_sorted <- c(midpoint, Inf)
+  lower[order_mu] <- lower_sorted
+  upper[order_mu] <- upper_sorted
+  cbind(lower = lower, upper = upper)
+}
+
+.ash_hmm_update_means <- function(mu, anchor, statistics,
+                                  learn, fixed, minimum_count = 2,
+                                  eligible = rep(TRUE, length(mu)),
+                                  damping = 1,
+                                  bounds = c("voronoi", "none")) {
+  bounds <- match.arg(bounds)
+  m <- length(mu)
+  if (length(eligible) != m || anyNA(eligible)) {
+    stop("'eligible' must contain one non-missing value per state.",
+         call. = FALSE)
+  }
+  eligible <- as.logical(eligible)
+  damping <- rep(damping, length.out = m)
+  if (anyNA(damping) || any(!is.finite(damping)) ||
+      any(damping < 0 | damping > 1)) {
+    stop("Every mean damping value must lie in [0, 1].", call. = FALSE)
+  }
+  if (!learn || !m) {
+    return(list(mu = mu, raw = mu, updated = rep(FALSE, m),
+                lower = rep(-Inf, m), upper = rep(Inf, m)))
+  }
+  interval <- if (bounds == "voronoi") {
+    .ash_hmm_voronoi_bounds(anchor)
+  } else {
+    cbind(lower = rep(-Inf, m), upper = rep(Inf, m))
+  }
+  raw <- mu
+  estimable <- eligible & statistics$occupancy >= minimum_count &
+    is.finite(statistics$mean_precision) & statistics$mean_precision > 0
+  estimable[fixed] <- FALSE
+  raw[estimable] <- statistics$mean_numerator[estimable] /
+    statistics$mean_precision[estimable]
+  target <- pmax(interval[, "lower"], pmin(interval[, "upper"], raw))
+  updated <- estimable & is.finite(target) & damping > 0
+  ans <- mu
+  ans[updated] <- mu[updated] +
+    damping[updated] * (target[updated] - mu[updated])
+  ans[fixed] <- mu[fixed]
+  list(mu = ans, raw = raw, updated = updated,
+       lower = interval[, "lower"], upper = interval[, "upper"])
+}
+
+# Mark the lower-occupancy member of each very close pair as a possible pruning
+# candidate. Actual deletion is accepted only after the caller checks the HMM
+# marginal likelihood.
+.ash_hmm_close_state_candidates <- function(mu, occupancy, distance,
+                                             protected = integer()) {
+  if (length(mu) < 2L || !is.finite(distance) || distance <= 0) {
+    return(integer())
+  }
+  ord <- order(mu)
+  close <- which(diff(mu[ord]) <= distance)
+  if (!length(close)) return(integer())
+  drop <- integer()
+  for (j in close) {
+    pair <- ord[c(j, j + 1L)]
+    eligible <- setdiff(pair, protected)
+    if (!length(eligible)) next
+    if (length(eligible) == 1L) {
+      drop <- c(drop, eligible)
+    } else {
+      drop <- c(drop, eligible[which.min(occupancy[eligible])])
+    }
+  }
+  unique(drop)
 }
 
 .ash_hmm_expand_prior <- function(x, nr, nc, name) {
@@ -318,7 +508,7 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
   incoming <- lapply(seq_len(m), function(j) which(edge[, 2L] == j))
   segments <- .ash_hmm_segments(sequence_id)
   path <- integer(n)
-  
+
   for (segment in seq_along(segments$starts)) {
     first <- segments$starts[segment]
     last <- segments$ends[segment]
@@ -355,7 +545,7 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
   posterior_mean <- posterior_second <- prob_ge_zero <- prob_le_zero <-
     prob_zero <- numeric(n)
   log_rho <- .ash_hmm_safe_log(rho)
-  
+
   for (state in seq_len(m)) {
     terms <- matrix(-Inf, n, l)
     for (component in seq_len(l)) {
@@ -365,7 +555,7 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
     }
     component_probability <- exp(terms - log_emission[, state])
     state_mean <- state_second <- state_ge <- state_le <- state_zero <- numeric(n)
-    
+
     for (component in seq_len(l)) {
       tau <- prior_sd[component]
       if (tau == 0) {
@@ -389,7 +579,7 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
       state_le <- state_le + w * le
       state_zero <- state_zero + w * p0
     }
-    
+
     g <- gamma[, state]
     posterior_mean <- posterior_mean + g * state_mean
     posterior_second <- posterior_second + g * state_second
@@ -397,7 +587,7 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
     prob_le_zero <- prob_le_zero + g * state_le
     prob_zero <- prob_zero + g * state_zero
   }
-  
+
   posterior_variance <- pmax(0, posterior_second - posterior_mean^2)
   list(mean = posterior_mean,
        sd = sqrt(posterior_variance),
@@ -407,306 +597,27 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
        lfsr = pmin(prob_ge_zero, prob_le_zero))
 }
 
-# Fit the general ash-HMM by a coherent EM/Baum-Welch algorithm.
-fit_ash_hmm <- function(y, se, mu, prior_sd = NULL,
-                        sequence_id = rep(1L, length(y)),
-                        topology = c("hub", "full"),
-                        transition_mask = NULL,
-                        init_transition = NULL,
-                        init_prob = NULL,
-                        init_rho = NULL,
-                        stay_probability = 0.95,
-                        fixed_pointmass_states = integer(),
-                        shared_mixture = FALSE,
-                        estimate_init = FALSE,
-                        transition_prior = 1,
-                        mixture_prior = 1,
-                        init_prior = 1,
-                        maxiter = 200L,
-                        tolerance = 1e-8,
-                        verbose = FALSE) {
-  call <- match.call()
-  topology <- match.arg(topology)
-  .ash_hmm_check_data(y, se, sequence_id)
-  if (!is.numeric(mu) || !length(mu) || anyNA(mu) || any(!is.finite(mu))) {
-    stop("'mu' must be a finite numeric vector.", call. = FALSE)
-  }
-  if (mu[1L] != 0) {
-    warning("The hub state is state 1, but mu[1] is not zero.")
-  }
-  if (is.null(prior_sd)) prior_sd <- ash_sigma_grid(y, se)
-  if (!is.numeric(prior_sd) || !length(prior_sd) || anyNA(prior_sd) ||
-      any(!is.finite(prior_sd)) || any(prior_sd < 0) || prior_sd[1L] != 0) {
-    stop("'prior_sd' must be finite, nonnegative, and start with zero.", call. = FALSE)
-  }
-  if (is.unsorted(prior_sd, strictly = FALSE)) {
-    stop("'prior_sd' must be sorted in nondecreasing order.", call. = FALSE)
-  }
-  
-  n <- length(y)
-  m <- length(mu)
-  l <- length(prior_sd)
-  maxiter <- as.integer(maxiter)
-  if (maxiter < 1L || tolerance <= 0) {
-    stop("Require maxiter >= 1 and tolerance > 0.", call. = FALSE)
-  }
-  fixed_pointmass_states <- sort(unique(as.integer(fixed_pointmass_states)))
-  if (any(fixed_pointmass_states < 1L | fixed_pointmass_states > m)) {
-    stop("'fixed_pointmass_states' contains an invalid state index.", call. = FALSE)
-  }
-  
-  if (is.null(transition_mask)) {
-    transition_mask <- ash_hmm_transition_mask(m, topology)
-  } else {
-    if (!is.matrix(transition_mask) || any(dim(transition_mask) != c(m, m))) {
-      stop("'transition_mask' must be an M by M matrix.", call. = FALSE)
-    }
-    transition_mask <- transition_mask != 0
-    if (any(rowSums(transition_mask) == 0)) {
-      stop("Every state needs at least one allowed outgoing transition.", call. = FALSE)
-    }
-  }
-  
-  if (is.null(init_transition)) {
-    A <- .ash_hmm_initial_transition(transition_mask, stay_probability)
-  } else {
-    A <- .ash_hmm_validate_transition(init_transition, transition_mask)
-  }
-  
-  if (is.null(init_prob)) init_prob <- .ash_hmm_stationary(A)
-  if (!is.numeric(init_prob) || length(init_prob) != m || anyNA(init_prob) ||
-      any(!is.finite(init_prob)) || any(init_prob < 0) || sum(init_prob) <= 0) {
-    stop("'init_prob' must be a nonnegative length-M vector with positive mass.", call. = FALSE)
-  }
-  init_prob <- .ash_hmm_normalize(init_prob)
-  
-  if (is.null(init_rho)) {
-    rho <- matrix(1 / l, m, l)
-  } else {
-    if (!is.matrix(init_rho) || any(dim(init_rho) != c(m, l)) ||
-        anyNA(init_rho) || any(!is.finite(init_rho)) || any(init_rho < 0) ||
-        any(rowSums(init_rho) <= 0)) {
-      stop("'init_rho' must be a nonnegative M by L matrix with positive row sums.",
-           call. = FALSE)
-    }
-    rho <- init_rho / rowSums(init_rho)
-  }
-  if (length(fixed_pointmass_states)) {
-    rho[fixed_pointmass_states, ] <- 0
-    rho[fixed_pointmass_states, 1L] <- 1
-  }
-  
-  transition_prior <- .ash_hmm_expand_prior(transition_prior, m, m,
-                                            "transition_prior")
-  mixture_prior <- .ash_hmm_expand_prior(mixture_prior, m, l, "mixture_prior")
-  init_prior <- rep(init_prior, length.out = m)
-  if (anyNA(init_prior) || any(!is.finite(init_prior)) || any(init_prior < 1)) {
-    stop("Every 'init_prior' entry must be finite and at least one.", call. = FALSE)
-  }
-  
-  mixture_active <- matrix(TRUE, m, l)
-  if (length(fixed_pointmass_states)) {
-    mixture_active[fixed_pointmass_states, ] <- FALSE
-  }
-  
-  objective_value <- function(log_likelihood, A, rho, init_prob) {
-    ans <- log_likelihood +
-      .ash_hmm_dirichlet_penalty(A, transition_prior, transition_mask) +
-      .ash_hmm_dirichlet_penalty(rho, mixture_prior, mixture_active)
-    if (estimate_init) {
-      use <- init_prior > 1
-      if (any(use)) {
-        if (any(init_prob[use] <= 0)) return(-Inf)
-        ans <- ans + sum((init_prior[use] - 1) * log(init_prob[use]))
-      }
-    }
-    ans
-  }
-  
-  log_emission <- .ash_hmm_log_emission(y, se, mu, prior_sd, rho)
-  fb <- .ash_hmm_forward_backward(log_emission, A, init_prob,
-                                  transition_mask, sequence_id)
-  objective <- objective_value(fb$log_likelihood, A, rho, init_prob)
-  history <- data.frame(iteration = 0L,
-                        log_likelihood = fb$log_likelihood,
-                        objective = objective)
-  converged <- FALSE
-  
-  free_states <- setdiff(seq_len(m), fixed_pointmass_states)
-  for (iter in seq_len(maxiter)) {
-    component_counts <- .ash_hmm_component_counts(
-      y, se, mu, prior_sd, rho, log_emission, fb$state_probability)
-    
-    rho_new <- rho
-    if (length(free_states)) {
-      if (shared_mixture) {
-        numerator <- colSums(component_counts[free_states, , drop = FALSE]) +
-          colSums(mixture_prior[free_states, , drop = FALSE] - 1)
-        common <- .ash_hmm_normalize(numerator,
-                                     fallback = colMeans(rho[free_states, , drop = FALSE]))
-        rho_new[free_states, ] <- matrix(rep(common, each = length(free_states)),
-                                         length(free_states), l)
-      } else {
-        for (state in free_states) {
-          numerator <- component_counts[state, ] + mixture_prior[state, ] - 1
-          rho_new[state, ] <- .ash_hmm_normalize(numerator, fallback = rho[state, ])
-        }
-      }
-    }
-    if (length(fixed_pointmass_states)) {
-      rho_new[fixed_pointmass_states, ] <- 0
-      rho_new[fixed_pointmass_states, 1L] <- 1
-    }
-    
-    A_new <- matrix(0, m, m)
-    for (state in seq_len(m)) {
-      allowed <- which(transition_mask[state, ])
-      numerator <- fb$transition_counts[state, allowed] +
-        transition_prior[state, allowed] - 1
-      A_new[state, allowed] <- .ash_hmm_normalize(
-        numerator, fallback = A[state, allowed])
-    }
-    
-    init_prob_new <- init_prob
-    if (estimate_init) {
-      numerator <- fb$initial_counts + init_prior - 1
-      init_prob_new <- .ash_hmm_normalize(numerator, fallback = init_prob)
-    }
-    
-    log_emission_new <- .ash_hmm_log_emission(y, se, mu, prior_sd, rho_new)
-    fb_new <- .ash_hmm_forward_backward(log_emission_new, A_new, init_prob_new,
-                                        transition_mask, sequence_id)
-    objective_new <- objective_value(fb_new$log_likelihood, A_new, rho_new,
-                                     init_prob_new)
-    history <- rbind(history,
-                     data.frame(iteration = iter,
-                                log_likelihood = fb_new$log_likelihood,
-                                objective = objective_new))
-    
-    if (verbose) {
-      message(sprintf("iteration %d: logLik = %.10f, objective = %.10f",
-                      iter, fb_new$log_likelihood, objective_new))
-    }
-    if (objective_new < objective - 1e-7 * (1 + abs(objective))) {
-      warning("The EM objective decreased beyond numerical tolerance.")
-    }
-    
-    delta <- objective_new - objective
-    A <- A_new
-    rho <- rho_new
-    init_prob <- init_prob_new
-    log_emission <- log_emission_new
-    fb <- fb_new
-    objective <- objective_new
-    
-    if (abs(delta) <= tolerance * (1 + abs(objective))) {
-      converged <- TRUE
-      break
-    }
-  }
-  
-  posterior <- .ash_hmm_posterior_summary(
-    y, se, mu, prior_sd, rho, log_emission, fb$state_probability)
-  viterbi_state <- .ash_hmm_viterbi(log_emission, A, init_prob,
-                                    transition_mask, sequence_id)
-  log_null <- sum(stats::dnorm(y, mean = 0, sd = se, log = TRUE))
-  
-  ans <- list(call = call,
-              state_probability = fb$state_probability,
-              posterior = posterior,
-              viterbi_state = viterbi_state,
-              boundary_probability = fb$boundary_probability,
-              fitted = list(mu = mu,
-                            prior_sd = prior_sd,
-                            mixture_weight = rho,
-                            transition = A,
-                            transition_mask = transition_mask,
-                            init_prob = init_prob,
-                            shared_mixture = shared_mixture,
-                            fixed_pointmass_states = fixed_pointmass_states),
-              log_likelihood = fb$log_likelihood,
-              log_null = log_null,
-              log_evidence_ratio = fb$log_likelihood - log_null,
-              history = history,
-              converged = converged,
-              iterations = nrow(history) - 1L)
-  class(ans) <- "ash_hmm_fit"
-  ans
-}
 
+
+
+#' @export
 print.ash_hmm_fit <- function(x, ...) {
   cat("Adaptive-shrinkage HMM fit\n")
   cat("  observations:", nrow(x$state_probability), "\n")
-  cat("  states:", ncol(x$state_probability), "\n")
+  cat("  states:", ncol(x$state_probability))
+  if (isTRUE(x$grid$automatic)) {
+    cat(" (retained from", length(x$grid$full_mu), "automatic candidates)")
+  }
+  cat("\n")
+  if (isTRUE(x$fitted$learn_state_means)) {
+    moved <- sum(abs(x$fitted$mu - x$fitted$mean_anchor) > 1e-10)
+    cat("  learned state means:", moved, "of", length(x$fitted$mu), "\n")
+  }
+  if (!is.null(x$pruning_history) && nrow(x$pruning_history)) {
+    cat("  dynamically pruned states:", nrow(x$pruning_history), "\n")
+  }
   cat("  iterations:", x$iterations,
       if (x$converged) "(converged)" else "(maximum reached)", "\n")
   cat("  log likelihood:", format(x$log_likelihood, digits = 8), "\n")
   invisible(x)
-}
-
-# Exact two-state reduction used in the supplied binary-Markov paper.
-# The state means are point masses and A(q) has one symmetric flip parameter.
-fit_binary_markov <- function(y, se, state_means = c(0, 1),
-                              sequence_id = rep(1L, length(y)),
-                              q_interval = c(0, 0.5),
-                              grid_size = 501L,
-                              init_prob = c(0.5, 0.5)) {
-  .ash_hmm_check_data(y, se, sequence_id)
-  if (!is.numeric(state_means) || length(state_means) != 2L ||
-      anyNA(state_means) || any(!is.finite(state_means))) {
-    stop("'state_means' must contain two finite values.", call. = FALSE)
-  }
-  if (length(q_interval) != 2L || q_interval[1L] < 0 ||
-      q_interval[2L] > 1 || q_interval[1L] >= q_interval[2L]) {
-    stop("'q_interval' must be an increasing subinterval of [0, 1].",
-         call. = FALSE)
-  }
-  if (!is.numeric(init_prob) || length(init_prob) != 2L || anyNA(init_prob) ||
-      any(!is.finite(init_prob)) || any(init_prob < 0) || sum(init_prob) <= 0) {
-    stop("'init_prob' must be a nonnegative length-two vector with positive mass.",
-         call. = FALSE)
-  }
-  grid_size <- as.integer(grid_size)
-  if (grid_size < 5L) stop("'grid_size' must be at least five.", call. = FALSE)
-  init_prob <- .ash_hmm_normalize(init_prob)
-  mask <- matrix(TRUE, 2L, 2L)
-  log_emission <- cbind(
-    stats::dnorm(y, state_means[1L], se, log = TRUE),
-    stats::dnorm(y, state_means[2L], se, log = TRUE))
-  
-  evaluate <- function(q, details = FALSE) {
-    A <- matrix(c(1 - q, q, q, 1 - q), 2L, 2L, byrow = TRUE)
-    fb <- .ash_hmm_forward_backward(log_emission, A, init_prob, mask, sequence_id)
-    if (details) return(list(A = A, fb = fb))
-    fb$log_likelihood
-  }
-  
-  grid <- seq(q_interval[1L], q_interval[2L], length.out = grid_size)
-  values <- vapply(grid, evaluate, numeric(1L))
-  local <- which(values[2L:(grid_size - 1L)] >= values[1L:(grid_size - 2L)] &
-                   values[2L:(grid_size - 1L)] >= values[3L:grid_size]) + 1L
-  candidates <- data.frame(q = c(grid[1L], grid[grid_size]),
-                           log_likelihood = c(values[1L], values[grid_size]))
-  if (length(local)) {
-    for (i in local) {
-      refined <- stats::optimize(function(q) -evaluate(q),
-                                 interval = c(grid[i - 1L], grid[i + 1L]))
-      candidates <- rbind(candidates,
-                          data.frame(q = refined$minimum,
-                                     log_likelihood = -refined$objective))
-    }
-  }
-  best <- candidates[which.max(candidates$log_likelihood), ]
-  details <- evaluate(best$q, details = TRUE)
-  viterbi <- .ash_hmm_viterbi(log_emission, details$A, init_prob, mask, sequence_id)
-  
-  list(q = best$q,
-       expected_run_length = if (best$q > 0) 1 / best$q else Inf,
-       state_probability = details$fb$state_probability,
-       boundary_probability = details$fb$boundary_probability,
-       viterbi_state = viterbi,
-       transition = details$A,
-       init_prob = init_prob,
-       log_likelihood = details$fb$log_likelihood,
-       search = list(grid = grid, values = values, candidates = candidates))
 }
