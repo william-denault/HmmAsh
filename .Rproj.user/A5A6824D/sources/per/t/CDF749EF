@@ -1,26 +1,27 @@
 {
-    "id": "FA305D52",
-    "path": "C:/Users/willi/AppData/Local/Temp/359f8f98-7d25-4b0b-9e2f-9fd3d61e158c_ash_hmm_native_learned_means_bundle.zip.58c/utils.R",
-    "project_path": null,
+    "id": "CDF749EF",
+    "path": "C:/Document/Serieux/Travail/Package/HmmAsh/R/utils.R",
+    "project_path": "R/utils.R",
     "type": "r_source",
-    "hash": "0",
+    "hash": "3935329318",
     "contents": "",
     "dirty": false,
-    "created": 1784739744119.0,
+    "created": 1784739995628.0,
     "source_on_save": false,
-    "relative_order": 5,
+    "relative_order": 6,
     "properties": {
         "source_window_id": "",
         "Source": "Source",
         "cursorPosition": "623,0",
-        "scrollLine": "0"
+        "scrollLine": "555",
+        "docOutlineVisible": "1"
     },
     "folds": "",
-    "lastKnownWriteTime": 1784739743,
+    "lastKnownWriteTime": 1784739997,
     "encoding": "UTF-8",
     "collab_server": "",
     "source_window": "",
-    "last_content_update": 1784739743,
+    "last_content_update": 1784739997394,
     "read_only": false,
     "read_only_alternatives": []
 }

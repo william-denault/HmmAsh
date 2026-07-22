@@ -10,6 +10,8 @@
 #
 # prior_sd[1] must be zero, so the first component is a point mass at mu[m].
 # Candidate means and prior standard deviations may be generated from y and se.
+# By default the null state is exactly delta_0; set null_state = "adaptive"
+# to estimate an ash mixture centered at zero for that state as well.
 # After a short fixed-grid warm-up, supported non-null means can be learned by
 # the same EM sufficient statistics used for rho. Voronoi constraints and
 # likelihood-checked state pruning prevent dense candidates from collapsing.
@@ -23,6 +25,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                         grid_shape = 1.5,
                         grid_expansion = 1.5,
                         grid_max_abs = NULL,
+                        positive_state_means = TRUE,
+                        positive_mean_floor = NULL,
                         prefilter = NULL,
                         min_state_count = 0.5,
                         min_state_fraction = 1e-5,
@@ -35,7 +39,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                         init_prob = NULL,
                         init_rho = NULL,
                         stay_probability = 0.95,
-                        fixed_pointmass_states = integer(),
+                        null_state = c("pointmass", "adaptive"),
+                        fixed_pointmass_states = NULL,
                         shared_mixture = FALSE,
                         estimate_init = FALSE,
                         transition_prior = 1,
@@ -57,13 +62,25 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                         prune_max_fraction = 0.25,
                         prune_max_loglik_loss = 0.05,
                         merge_distance = NULL,
+                        null_model_selection = c("bic", "none"),
+                        null_selection_gamma = 1,
+                        null_bic_margin = 0,
+                        parameter_tolerance = 1e-6,
+                        step_penalty = NULL,
+                        step_penalty_scale = 1,
                         maxiter = 200L,
                         tolerance = 1e-8,
                         verbose = FALSE) {
   call <- match.call()
   topology <- match.arg(topology)
   mean_bounds <- match.arg(mean_bounds)
+  null_model_selection <- match.arg(null_model_selection)
+  null_state <- match.arg(null_state)
   .ash_hmm_check_data(y, se, sequence_id)
+  if (!is.logical(positive_state_means) ||
+      length(positive_state_means) != 1L || is.na(positive_state_means)) {
+    stop("'positive_state_means' must be TRUE or FALSE.", call. = FALSE)
+  }
 
   automatic_mu <- is.null(mu)
   if (is.null(prefilter)) prefilter <- automatic_mu
@@ -88,11 +105,13 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
         min_state_count = min_state_count,
         min_state_fraction = min_state_fraction,
         screening_prior_sd = screening_prior_sd,
-        block_size = screening_block_size)
+        block_size = screening_block_size,
+        positive_only = positive_state_means)
       mu <- grid_selection$selected_mu
     } else {
       mu <- ash_mu_grid(y, half_grid = half_grid, shape = grid_shape,
-                        expansion = grid_expansion, max_abs = grid_max_abs)
+                        expansion = grid_expansion, max_abs = grid_max_abs,
+                        positive_only = positive_state_means)
       grid_selection <- list(
         automatic = TRUE,
         full_mu = mu,
@@ -136,7 +155,13 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
     }
   }
 
-  if (mu[1L] != 0) {
+  if (positive_state_means) {
+    if (mu[1L] != 0 || (length(mu) > 1L && any(mu[-1L] <= 0))) {
+      stop(paste("With 'positive_state_means = TRUE', mu[1] must equal zero",
+                 "and every non-null state center must be strictly positive."),
+           call. = FALSE)
+    }
+  } else if (mu[1L] != 0) {
     warning("The hub state is state 1, but mu[1] is not zero.")
   }
   automatic_prior_sd <- is.null(prior_sd)
@@ -172,6 +197,10 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
   scalar_nonnegative <- function(x) {
     is.numeric(x) && length(x) == 1L && !is.na(x) && is.finite(x) && x >= 0
   }
+  if (is.null(positive_mean_floor)) {
+    positive_mean_floor <- sqrt(.Machine$double.eps) *
+      max(1, stats::median(se))
+  }
   if (!scalar_nonnegative(mean_min_effective_count) ||
       !scalar_nonnegative(mean_min_pointmass_weight) ||
       mean_min_pointmass_weight > 1 ||
@@ -185,8 +214,23 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
       !is.numeric(prune_max_fraction) || length(prune_max_fraction) != 1L ||
       !is.finite(prune_max_fraction) || prune_max_fraction <= 0 ||
       prune_max_fraction >= 1 ||
-      !scalar_nonnegative(prune_max_loglik_loss)) {
+      !scalar_nonnegative(prune_max_loglik_loss) ||
+      !scalar_nonnegative(positive_mean_floor) ||
+      !scalar_nonnegative(null_selection_gamma) ||
+      !scalar_nonnegative(null_bic_margin) ||
+      !scalar_nonnegative(parameter_tolerance) || parameter_tolerance == 0 ||
+      !scalar_nonnegative(step_penalty_scale)) {
     stop("Invalid state-mean learning or pruning control.", call. = FALSE)
+  }
+  if (positive_state_means && positive_mean_floor <= 0) {
+    stop("'positive_mean_floor' must be strictly positive.", call. = FALSE)
+  }
+  if (is.null(step_penalty)) {
+    step_penalty <- step_penalty_scale * log(max(2, n))
+  }
+  if (!scalar_nonnegative(step_penalty)) {
+    stop("'step_penalty' must be NULL or a finite nonnegative scalar.",
+         call. = FALSE)
   }
   if (is.null(merge_distance)) merge_distance <- 0.05 * stats::median(se)
   if (!scalar_nonnegative(merge_distance)) {
@@ -196,6 +240,9 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
   if (verbose && automatic_mu) {
     message(sprintf("automatic mean grid: retained %d of %d states before HMM fitting",
                     length(mu), length(grid_selection$full_mu)))
+  }
+  if (is.null(fixed_pointmass_states)) {
+    fixed_pointmass_states <- if (null_state == "pointmass") 1L else integer()
   }
   fixed_pointmass_states <- sort(unique(as.integer(fixed_pointmass_states)))
   if (any(fixed_pointmass_states < 1L | fixed_pointmass_states > m)) {
@@ -370,6 +417,9 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
       minimum_count = mean_min_effective_count,
       eligible = mean_state_enabled,
       damping = mean_damping * persistence_damping,
+      minimum = if (positive_state_means) {
+        c(0, rep(positive_mean_floor, max(0L, m - 1L)))
+      } else rep(-Inf, m),
       bounds = mean_bounds)
     mu_new <- mean_update$mu
 
@@ -547,13 +597,99 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
     }
   }
 
+  log_null <- sum(stats::dnorm(y, mean = 0, sd = se, log = TRUE))
+  initial_selected_mu <- grid_selection$selected_mu
+  initial_selected_index <- grid_selection$selected_index
+  learned_mean_states <- setdiff(which(mean_state_enabled), fixed_mean_states)
+  effective_parameters <- .ash_hmm_effective_parameter_count(
+    A, transition_mask, rho, fixed_pointmass_states,
+    learned_mean_states, estimate_init, init_prob, parameter_tolerance)
+  candidate_count <- max(1L, length(grid_selection$full_mu) - 1L)
+  full_bic <- -2 * fb$log_likelihood +
+    effective_parameters * log(max(2, n)) +
+    2 * null_selection_gamma * log(candidate_count)
+  null_bic <- -2 * log_null
+  collapse_to_null <- null_model_selection == "bic" &&
+    null_bic + null_bic_margin <= full_bic
+  model_selection <- list(
+    method = null_model_selection,
+    selected = if (collapse_to_null) "strict_null" else "positive_ash_hmm",
+    collapsed_to_null = collapse_to_null,
+    full_log_likelihood = fb$log_likelihood,
+    null_log_likelihood = log_null,
+    effective_parameters = effective_parameters,
+    candidate_count = candidate_count,
+    full_bic = full_bic,
+    null_bic = null_bic,
+    grid_penalty_gamma = null_selection_gamma,
+    margin = null_bic_margin)
+
+  if (collapse_to_null) {
+    removed <- if (m > 1L) 2L:m else integer()
+    occupancy_before_null <- colSums(fb$state_probability)
+    pruning_history <- rbind(
+      pruning_history,
+      data.frame(iteration = rep(max(history$iteration) + 1L, length(removed)),
+                 state_id = state_id[removed],
+                 grid_index = grid_index[removed],
+                 anchor_mu = mean_anchor[removed],
+                 fitted_mu = mu[removed],
+                 occupancy = occupancy_before_null[removed],
+                 reason = rep("global BIC selected strict null", length(removed)),
+                 stringsAsFactors = FALSE))
+    pruned_grid_index <- c(pruned_grid_index, grid_index[removed])
+
+    state_id <- state_id[1L]
+    grid_index <- grid_index[1L]
+    mean_anchor <- 0
+    mu <- 0
+    m <- 1L
+    rho <- matrix(0, 1L, l)
+    rho[1L, 1L] <- 1
+    A <- matrix(1, 1L, 1L)
+    transition_mask <- matrix(TRUE, 1L, 1L)
+    init_prob <- 1
+    transition_prior <- matrix(transition_prior[1L, 1L], 1L, 1L)
+    mixture_prior <- matrix(mixture_prior[1L, ], 1L, l)
+    init_prior <- init_prior[1L]
+    mixture_active <- matrix(FALSE, 1L, l)
+    fixed_pointmass_states <- 1L
+    fixed_mean_states <- 1L
+    mean_state_enabled <- FALSE
+    log_emission <- .ash_hmm_log_emission(y, se, mu, prior_sd, rho)
+    fb <- .ash_hmm_forward_backward(
+      log_emission, A, init_prob, transition_mask, sequence_id)
+    objective <- objective_value(
+      fb$log_likelihood, A, rho, init_prob,
+      transition_prior, transition_mask, mixture_prior,
+      mixture_active, init_prior)
+    history <- rbind(
+      history,
+      data.frame(iteration = max(history$iteration) + 1L,
+                 log_likelihood = fb$log_likelihood,
+                 objective = objective,
+                 states = 1L,
+                 means_updated = 0L,
+                 states_pruned = length(removed)))
+    mean_history[[length(mean_history) + 1L]] <- data.frame(
+      iteration = max(history$iteration), state_id = state_id,
+      grid_index = grid_index, anchor_mu = 0, mu = 0,
+      occupancy = n)
+    converged <- TRUE
+  }
+
   posterior <- .ash_hmm_posterior_summary(
     y, se, mu, prior_sd, rho, log_emission, fb$state_probability)
   viterbi_state <- .ash_hmm_viterbi(log_emission, A, init_prob,
                                     transition_mask, sequence_id)
-  log_null <- sum(stats::dnorm(y, mean = 0, sd = se, log = TRUE))
-  grid_selection$initial_selected_mu <- grid_selection$selected_mu
-  grid_selection$initial_selected_index <- grid_selection$selected_index
+  penalized_state <- .ash_hmm_penalized_viterbi(
+    log_emission, transition_mask, sequence_id, step_penalty)
+  step_summary <- .ash_hmm_step_summary(
+    penalized_state, sequence_id, mu)
+  step_summary$state <- penalized_state
+  step_summary$penalty <- step_penalty
+  grid_selection$initial_selected_mu <- initial_selected_mu
+  grid_selection$initial_selected_index <- initial_selected_index
   grid_selection$selected_mu <- mu
   grid_selection$selected_index <- grid_index
   grid_selection$removed_index <- sort(unique(c(
@@ -564,6 +700,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
               state_probability = fb$state_probability,
               posterior = posterior,
               viterbi_state = viterbi_state,
+              penalized_state = penalized_state,
+              step_selection = step_summary,
               boundary_probability = fb$boundary_probability,
               fitted = list(mu = mu,
                             prior_sd = prior_sd,
@@ -572,6 +710,9 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                             transition_mask = transition_mask,
                             init_prob = init_prob,
                             shared_mixture = shared_mixture,
+                            null_state = if (1L %in% fixed_pointmass_states) {
+                              "pointmass"
+                            } else "adaptive",
                             fixed_pointmass_states = fixed_pointmass_states,
                             fixed_mean_states = fixed_mean_states,
                             state_id = state_id,
@@ -584,13 +725,16 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                             mean_min_effective_count = mean_min_effective_count,
                             mean_min_pointmass_weight = mean_min_pointmass_weight,
                             mean_min_self_transition = mean_min_self_transition,
-                            mean_damping = mean_damping),
+                            mean_damping = mean_damping,
+                            positive_state_means = positive_state_means,
+                            positive_mean_floor = positive_mean_floor),
               grid = c(grid_selection,
                        list(automatic_prior_sd = automatic_prior_sd,
                             selected_prior_sd = prior_sd)),
               log_likelihood = fb$log_likelihood,
               log_null = log_null,
               log_evidence_ratio = fb$log_likelihood - log_null,
+              model_selection = model_selection,
               history = history,
               mean_history = do.call(rbind, mean_history),
               pruning_history = pruning_history,

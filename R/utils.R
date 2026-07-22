@@ -1,4 +1,4 @@
-.ash_hmm_version <- "1.2.0-native-learned-means"
+.ash_hmm_version <- "1.3.0-positive-steps-null-safe"
 
 #' Return the implementation version.
 #' @export
@@ -74,7 +74,7 @@ ash_sigma_grid <- function(y, se, multiplier = sqrt(2), sigma_min = NULL,
 
 # Symmetric state-mean grid with the zero/hub state first.
 ash_mu_grid <- function(y, half_grid = 100L, shape = 3, expansion = 1.5,
-                        max_abs = NULL) {
+                        max_abs = NULL, positive_only = FALSE) {
   if (!is.numeric(y) || !length(y) || anyNA(y) || any(!is.finite(y))) {
     stop("'y' must be a finite numeric vector.", call. = FALSE)
   }
@@ -85,6 +85,7 @@ ash_mu_grid <- function(y, half_grid = 100L, shape = 3, expansion = 1.5,
   if (is.null(max_abs)) max_abs <- max(abs(y))
   if (!is.finite(max_abs) || max_abs <= 0) max_abs <- 1
   positive <- seq(0, 1, length.out = half_grid)^(1 / shape) * expansion * max_abs
+  if (isTRUE(positive_only)) return(positive)
   c(positive, -positive[-1L])
 }
 
@@ -163,10 +164,12 @@ ash_hmm_select_grid <- function(y, se,
                                 min_state_count = 0.5,
                                 min_state_fraction = 1e-5,
                                 screening_prior_sd = 0,
-                                block_size = 5000L) {
+                                block_size = 5000L,
+                                positive_only = FALSE) {
   .ash_hmm_check_data(y, se, rep(1L, length(y)))
   candidate <- ash_mu_grid(y, half_grid = half_grid, shape = shape,
-                           expansion = expansion, max_abs = max_abs)
+                           expansion = expansion, max_abs = max_abs,
+                           positive_only = positive_only)
   ans <- .ash_hmm_prefilter_mu(
     y, se, candidate,
     min_state_count = min_state_count,
@@ -415,6 +418,7 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
                                   learn, fixed, minimum_count = 2,
                                   eligible = rep(TRUE, length(mu)),
                                   damping = 1,
+                                  minimum = rep(-Inf, length(mu)),
                                   bounds = c("voronoi", "none")) {
   bounds <- match.arg(bounds)
   m <- length(mu)
@@ -428,6 +432,10 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
       any(damping < 0 | damping > 1)) {
     stop("Every mean damping value must lie in [0, 1].", call. = FALSE)
   }
+  minimum <- rep(minimum, length.out = m)
+  if (anyNA(minimum)) {
+    stop("Mean lower bounds must not be missing.", call. = FALSE)
+  }
   if (!learn || !m) {
     return(list(mu = mu, raw = mu, updated = rep(FALSE, m),
                 lower = rep(-Inf, m), upper = rep(Inf, m)))
@@ -437,6 +445,7 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
   } else {
     cbind(lower = rep(-Inf, m), upper = rep(Inf, m))
   }
+  interval[, "lower"] <- pmax(interval[, "lower"], minimum)
   raw <- mu
   estimable <- eligible & statistics$occupancy >= minimum_count &
     is.finite(statistics$mean_precision) & statistics$mean_precision > 0
@@ -451,6 +460,108 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
   ans[fixed] <- mu[fixed]
   list(mu = ans, raw = raw, updated = updated,
        lower = interval[, "lower"], upper = interval[, "upper"])
+}
+
+# Effective dimension used by the optional BIC/extended-BIC comparison with
+# the strict all-null model. Only numerically active simplex coordinates count;
+# this is a pragmatic diagnostic because ordinary BIC regularity fails on
+# mixture boundaries.
+.ash_hmm_effective_parameter_count <- function(
+    A, mask, rho, fixed_pointmass_states = integer(),
+    learned_mean_states = integer(), estimate_init = FALSE,
+    init_prob = NULL, tolerance = 1e-6) {
+  active_transition <- mask & A > tolerance
+  transition_df <- sum(pmax(rowSums(active_transition) - 1L, 0L))
+  mixture_df <- 0L
+  free <- setdiff(seq_len(nrow(rho)), fixed_pointmass_states)
+  if (length(free)) {
+    mixture_df <- sum(pmax(rowSums(rho[free, , drop = FALSE] > tolerance) - 1L, 0L))
+  }
+  mean_df <- length(unique(learned_mean_states))
+  init_df <- 0L
+  if (estimate_init && !is.null(init_prob)) {
+    init_df <- max(sum(init_prob > tolerance) - 1L, 0L)
+  }
+  as.integer(transition_df + mixture_df + mean_df + init_df)
+}
+
+# Decode a state path with an explicit l0 penalty for every state change. This
+# separates step-count selection from the fitted Markov transition matrix.
+.ash_hmm_penalized_viterbi <- function(log_emission, mask, sequence_id,
+                                       change_penalty) {
+  n <- nrow(log_emission)
+  m <- ncol(log_emission)
+  if (!is.numeric(change_penalty) || length(change_penalty) != 1L ||
+      !is.finite(change_penalty) || change_penalty < 0) {
+    stop("'change_penalty' must be a finite nonnegative scalar.", call. = FALSE)
+  }
+  segments <- .ash_hmm_segments(sequence_id)
+  path <- integer(n)
+  for (segment in seq_along(segments$starts)) {
+    first <- segments$starts[segment]
+    last <- segments$ends[segment]
+    len <- last - first + 1L
+    delta <- matrix(-Inf, len, m)
+    back <- matrix(NA_integer_, len, m)
+    delta[1L, ] <- log_emission[first, ]
+    if (len > 1L) {
+      for (tt in 2L:len) {
+        for (state in seq_len(m)) {
+          from <- which(mask[, state])
+          value <- delta[tt - 1L, from] -
+            change_penalty * as.numeric(from != state)
+          winner <- which.max(value)
+          delta[tt, state] <- log_emission[first + tt - 1L, state] + value[winner]
+          back[tt, state] <- from[winner]
+        }
+      }
+    }
+    path[last] <- which.max(delta[len, ])
+    if (len > 1L) {
+      for (t in last:(first + 1L)) {
+        path[t - 1L] <- back[t - first + 1L, path[t]]
+      }
+    }
+  }
+  path
+}
+
+.ash_hmm_step_summary <- function(path, sequence_id, mu = NULL) {
+  n <- length(path)
+  segments <- .ash_hmm_segments(sequence_id)
+  rows <- vector("list", 0L)
+  per_sequence <- data.frame(
+    sequence = character(), steps = integer(), changes = integer(),
+    stringsAsFactors = FALSE)
+  for (s in seq_along(segments$starts)) {
+    first <- segments$starts[s]
+    last <- segments$ends[s]
+    local_change <- if (first < last) {
+      which(path[(first + 1L):last] != path[first:(last - 1L)]) + first
+    } else integer()
+    starts <- c(first, local_change)
+    ends <- c(local_change - 1L, last)
+    for (j in seq_along(starts)) {
+      state <- path[starts[j]]
+      rows[[length(rows) + 1L]] <- data.frame(
+        sequence = as.character(sequence_id[first]),
+        start = starts[j], end = ends[j], length = ends[j] - starts[j] + 1L,
+        state = state,
+        state_mean = if (is.null(mu)) NA_real_ else mu[state],
+        stringsAsFactors = FALSE)
+    }
+    per_sequence <- rbind(
+      per_sequence,
+      data.frame(sequence = as.character(sequence_id[first]),
+                 steps = length(starts), changes = length(starts) - 1L,
+                 stringsAsFactors = FALSE))
+  }
+  segment_table <- if (length(rows)) do.call(rbind, rows) else data.frame()
+  list(segments = segment_table,
+       per_sequence = per_sequence,
+       step_count = sum(per_sequence$steps),
+       change_count = sum(per_sequence$changes),
+       occupied_state_count = length(unique(path)))
 }
 
 # Mark the lower-occupancy member of each very close pair as a possible pruning
@@ -615,6 +726,14 @@ print.ash_hmm_fit <- function(x, ...) {
   }
   if (!is.null(x$pruning_history) && nrow(x$pruning_history)) {
     cat("  dynamically pruned states:", nrow(x$pruning_history), "\n")
+  }
+  if (!is.null(x$model_selection) &&
+      isTRUE(x$model_selection$collapsed_to_null)) {
+    cat("  global model selection: strict null\n")
+  }
+  if (!is.null(x$step_selection)) {
+    cat("  penalized steps:", x$step_selection$step_count,
+        "(changes:", x$step_selection$change_count, ")\n")
   }
   cat("  iterations:", x$iterations,
       if (x$converged) "(converged)" else "(maximum reached)", "\n")
