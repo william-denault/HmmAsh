@@ -205,11 +205,11 @@
 #'
 #' @export
 fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
-                        half_grid = 50L,
+                        half_grid = 25L,
                         grid_shape = 1.1,
                         grid_expansion = 1.1,
                         grid_max_abs = NULL,
-                        nonnegative_state_means = TRUE,
+                        nonnegative_state_means = FALSE,
                         positive_state_means = NULL,
                         positive_mean_floor = NULL,
                         prefilter = NULL,

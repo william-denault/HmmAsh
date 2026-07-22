@@ -1,3 +1,5 @@
+rm(list=ls())
+
 library(HmmAsh)
 simulate_transcript <- function(seed = 20260716L, n = 180L, q = 0.06) {
   set.seed(seed)
@@ -31,7 +33,7 @@ fit <- fit_ash_hmm(
   shared_mixture = FALSE,
 
   verbose = TRUE,
-  maxiter = 2000
+  maxiter = 100
 )
 
 
