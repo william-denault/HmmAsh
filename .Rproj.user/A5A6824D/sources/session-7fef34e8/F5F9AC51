@@ -3,9 +3,9 @@
     "path": "C:/Document/Serieux/Travail/Package/HmmAsh/R/HmmAsh.R",
     "project_path": "R/HmmAsh.R",
     "type": "r_source",
-    "hash": "0",
+    "hash": "1632807136",
     "contents": "",
-    "dirty": true,
+    "dirty": false,
     "created": 1784580807952.0,
     "source_on_save": false,
     "relative_order": 1,
@@ -19,11 +19,11 @@
         "docOutlineSize": "202"
     },
     "folds": "",
-    "lastKnownWriteTime": 1784754156,
+    "lastKnownWriteTime": 1784755232,
     "encoding": "UTF-8",
     "collab_server": "",
     "source_window": "",
-    "last_content_update": 1784754640600,
+    "last_content_update": 1784755232190,
     "read_only": false,
     "read_only_alternatives": []
 }
