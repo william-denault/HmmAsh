@@ -17,15 +17,200 @@
 # likelihood-checked state pruning prevent dense candidates from collapsing.
 
 
-# Fit the general ash-HMM by a coherent EM/Baum-Welch algorithm.
-
+#' Fit an adaptive-shrinkage hidden Markov model
+#'
+#' @description
+#' Fits a finite-state hidden Markov model to heteroskedastic normal effect
+#' estimates. Each hidden state has an adaptive-shrinkage prior formed from a
+#' point mass at its state center and a grid of normal components centered at
+#' the same value. Transition probabilities, state-specific mixture weights,
+#' and (optionally) supported state centers are learned by generalized
+#' EM/Baum--Welch updates.
+#'
+#' @details
+#' If `mu` is `NULL`, a dense grid of candidate state centers is constructed
+#' from `y` and screened before the first forward-backward pass. With
+#' `nonnegative_state_means = TRUE`, state 1 is fixed at zero and all non-null
+#' state centers are constrained to be strictly positive. This constrains the
+#' state centers, not every draw from a normal ash component. Set
+#' `nonnegative_state_means = FALSE` to construct a signed symmetric grid.
+#'
+#' Low-occupancy or nearly duplicated states can be proposed for pruning.
+#' A proposed deletion is accepted only after recomputing the complete HMM
+#' marginal likelihood. After fitting, an optional information-criterion gate
+#' can replace the fitted model by the exact all-zero HMM, and a separate
+#' change-penalized decoder reports contiguous steps.
+#'
+#' @param y Numeric vector of noisy effect estimates.
+#' @param se Numeric vector of known standard errors. It must have the same
+#'   length as `y`, contain only finite values, and be strictly positive.
+#' @param mu Optional numeric vector of initial state centers. State 1 is the
+#'   zero/hub state. When `NULL`, centers are constructed and screened
+#'   automatically. Supply `mu` when using state-sized custom initial values.
+#' @param prior_sd Optional nondecreasing numeric vector of ash prior standard
+#'   deviations. Its first value must be zero, representing a point mass. When
+#'   `NULL`, a Stephens-style geometric scale grid is constructed automatically.
+#' @param half_grid Number of nonnegative candidates in the automatic mean
+#'   grid, including zero. Signed mode appends their nonzero negatives.
+#' @param grid_shape Positive power-grid shape parameter. Values above one put
+#'   relatively more candidates near the outer part of the range.
+#' @param grid_expansion Positive multiplier applied to the empirical maximum
+#'   absolute observation when constructing the automatic mean grid.
+#' @param grid_max_abs Optional finite positive endpoint used instead of
+#'   `max(abs(y))` when constructing the automatic grid.
+#' @param nonnegative_state_means Logical; if `TRUE` (default), use one state
+#'   centered at zero and constrain every non-null state center to be strictly
+#'   positive. If `FALSE`, allow signed state centers.
+#' @param positive_state_means Deprecated compatibility alias for
+#'   `nonnegative_state_means`. Leave as `NULL` in new code. If both arguments
+#'   are supplied, they must agree.
+#' @param positive_mean_floor Strict lower bound for learned non-null centers in
+#'   nonnegative mode. The default is a scale-aware numerical value.
+#' @param prefilter Logical controlling independent state-grid screening before
+#'   HMM fitting. The default is `TRUE` for an automatic grid and `FALSE` for a
+#'   supplied grid.
+#' @param min_state_count,min_state_fraction A prefilter candidate is retained
+#'   when its independent soft count is at least the larger of these absolute
+#'   and fractional thresholds. The zero state is always retained.
+#' @param screening_prior_sd Nonnegative extra prior standard deviation used
+#'   only in the independent prefilter score.
+#' @param screening_block_size Positive integer block size for memory-efficient
+#'   prefilter calculations.
+#' @param sequence_id Vector identifying independent sequences. Adjacent equal
+#'   values belong to one sequence; transitions are not counted across changes
+#'   in `sequence_id`.
+#' @param topology Transition topology used when `transition_mask` is `NULL`:
+#'   `"full"` allows all transitions; `"hub"` disallows direct transitions
+#'   between distinct non-null states.
+#' @param transition_mask Optional logical square matrix specifying allowed
+#'   transitions between the supplied/retained states.
+#' @param init_transition Optional initial row-stochastic transition matrix.
+#' @param init_prob Optional initial state-probability vector.
+#' @param init_rho Optional initial state-by-scale matrix of ash mixture weights.
+#' @param stay_probability Initial self-transition probability used when
+#'   constructing a transition matrix automatically. A scalar is recycled by
+#'   state.
+#' @param null_state Either `"pointmass"` (default), which fixes the null prior
+#'   to the Dirac mass at zero, or `"adaptive"`, which learns an ash mixture
+#'   centered at zero.
+#' @param fixed_pointmass_states Optional integer indices of states whose ash
+#'   mixture is fixed entirely on its point component. `NULL` derives the value
+#'   from `null_state`; an explicit value is an advanced override.
+#' @param shared_mixture Logical; if `TRUE`, all free states share one learned
+#'   vector of ash mixture weights. The default learns each state separately.
+#' @param estimate_init Logical; estimate initial state probabilities rather
+#'   than keeping their initialized values fixed.
+#' @param transition_prior Dirichlet parameters for allowed transition
+#'   probabilities. Supply a scalar or a state-by-state matrix; values must be
+#'   at least one.
+#' @param mixture_prior Dirichlet parameters for ash mixture weights. Supply a
+#'   scalar, a vector with one entry per scale, or a state-by-scale matrix;
+#'   values must be at least one.
+#' @param init_prior Dirichlet parameters for the initial distribution, used
+#'   only when `estimate_init = TRUE`.
+#' @param learn_state_means Logical; learn eligible non-null state centers after
+#'   the fixed-grid warm-up.
+#' @param fixed_mean_states Integer state indices whose centers are never moved.
+#'   State 1 should normally remain fixed.
+#' @param mean_update_start First EM iteration at which state-center updates and
+#'   center-eligibility decisions are allowed.
+#' @param mean_min_effective_count Minimum smoothed state occupancy required for
+#'   a center update.
+#' @param mean_min_pointmass_weight Minimum fitted weight on the state's point
+#'   component required for center learning.
+#' @param mean_min_self_transition Minimum self-transition probability required
+#'   for center learning. This favors persistent plateau-like states.
+#' @param mean_damping Number in `(0, 1]` multiplying each eligible center move.
+#' @param mean_bounds Either `"voronoi"` (default), which keeps centers in
+#'   nonoverlapping anchor cells, or `"none"`.
+#' @param prune_states Logical; enable likelihood-checked dynamic state pruning.
+#' @param prune_start First EM iteration eligible for dynamic pruning.
+#' @param prune_every Positive number of EM iterations between pruning checks.
+#' @param prune_min_state_count,prune_min_state_fraction A state is a
+#'   low-occupancy pruning candidate below the larger absolute/fractional cutoff.
+#' @param prune_max_fraction Maximum fraction of current states considered in
+#'   one deletion batch. It must lie strictly between zero and one.
+#' @param prune_max_loglik_loss Maximum allowed decrease in full HMM marginal
+#'   log likelihood for an accepted deletion batch.
+#' @param merge_distance Distance below which adjacent fitted centers are
+#'   considered near duplicates. `NULL` uses `0.05 * median(se)`.
+#' @param null_model_selection Either `"bic"` for the strict all-zero safety
+#'   comparison or `"none"` to retain the fitted HMM unconditionally.
+#' @param null_selection_gamma Nonnegative multiplier for the additional
+#'   candidate-grid term in the strict-null information criterion.
+#' @param null_bic_margin Nonnegative margin favoring retention of the fitted
+#'   HMM over the strict null.
+#' @param parameter_tolerance Positive threshold used when counting numerically
+#'   active parameters for the strict-null information criterion.
+#' @param step_penalty Nonnegative penalty for each state change in the separate
+#'   penalized decoder. `NULL` uses `step_penalty_scale * log(length(y))`.
+#' @param step_penalty_scale Nonnegative multiplier for the default step penalty.
+#' @param maxiter Maximum number of generalized EM iterations.
+#' @param tolerance Positive relative convergence tolerance for the penalized
+#'   fixed-dimensional objective.
+#' @param verbose Logical; print grid selection and per-iteration diagnostics.
+#'
+#' @return An object of class `ash_hmm_fit`, which is a list containing:
+#'   \describe{
+#'   \item{call}{The matched function call.}
+#'   \item{state_probability}{An observation-by-state matrix of smoothed
+#'     probabilities `Pr(Q[t] = m | y)`.}
+#'   \item{posterior}{A list containing the marginal posterior `mean`, `sd`,
+#'     `probability_ge_zero`, `probability_le_zero`, `probability_zero`, and
+#'     local false sign rate `lfsr` for every observation.}
+#'   \item{viterbi_state}{The ordinary joint MAP state path under the fitted
+#'     transition matrix.}
+#'   \item{penalized_state}{The state path from the explicit change-penalized
+#'     decoder.}
+#'   \item{step_selection}{A list with a segment table, per-sequence counts,
+#'     total `step_count`, total `change_count`, `occupied_state_count`, decoded
+#'     `state`, and the applied `penalty`.}
+#'   \item{boundary_probability}{Posterior probabilities of a state change
+#'     between adjacent observations; entries spanning independent sequences
+#'     are `NA`.}
+#'   \item{fitted}{Fitted centers and scale grid, mixture weights, transition
+#'     matrix and mask, initial probabilities, state identifiers and
+#'     occupancies, null-state type, constraints, and mean-learning settings.}
+#'   \item{grid}{Automatic-grid settings, original and retained candidates,
+#'     screening statistics, selected scale grid, and pruning history.}
+#'   \item{log_likelihood,log_null,log_evidence_ratio}{The fitted HMM marginal
+#'     log likelihood, exact all-zero log likelihood, and their difference.}
+#'   \item{model_selection}{Details of the optional strict-null comparison,
+#'     including criteria, effective dimension, and whether the result was
+#'     collapsed to the exact null.}
+#'   \item{history}{Per-iteration likelihood, objective, number of states,
+#'     moved centers, and pruned-state count.}
+#'   \item{mean_history}{Long-form history of state centers and occupancies.}
+#'   \item{pruning_history}{One row per removed state, recording its persistent
+#'     identifier, original grid index, centers, occupancy, and reason.}
+#'   \item{converged}{Logical convergence indicator.}
+#'   \item{iterations}{Number of completed generalized EM/model-reduction
+#'     iterations recorded after initialization.}
+#'   }
+#'
+#' @examples
+#' \dontrun{
+#' set.seed(1)
+#' truth <- c(rep(0, 50), rep(2, 50), rep(0, 50))
+#' se <- rep(0.5, length(truth))
+#' y <- rnorm(length(truth), truth, se)
+#'
+#' fit <- fit_ash_hmm(y, se, nonnegative_state_means = TRUE)
+#' fit$posterior$mean
+#' fit$step_selection$segments
+#'
+#' # Use a signed grid when negative state centers are scientifically possible.
+#' signed_fit <- fit_ash_hmm(y - 1, se, nonnegative_state_means = FALSE)
+#' }
+#'
 #' @export
 fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                         half_grid = 50L,
                         grid_shape = 1.1,
                         grid_expansion = 1.1,
                         grid_max_abs = NULL,
-                        positive_state_means = TRUE,
+                        nonnegative_state_means = TRUE,
+                        positive_state_means = NULL,
                         positive_mean_floor = NULL,
                         prefilter = NULL,
                         min_state_count = 0.5,
@@ -33,7 +218,7 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                         screening_prior_sd = 0,
                         screening_block_size = 5000L,
                         sequence_id = rep(1L, length(y)),
-                        topology = c(  "full", "hub"),
+                        topology = c("full", "hub"),
                         transition_mask = NULL,
                         init_transition = NULL,
                         init_prob = NULL,
@@ -72,14 +257,29 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                         tolerance = 1e-5,
                         verbose = TRUE) {
   call <- match.call()
+  nonnegative_was_missing <- missing(nonnegative_state_means)
   topology <- match.arg(topology)
   mean_bounds <- match.arg(mean_bounds)
   null_model_selection <- match.arg(null_model_selection)
   null_state <- match.arg(null_state)
   .ash_hmm_check_data(y, se, sequence_id)
-  if (!is.logical(positive_state_means) ||
-      length(positive_state_means) != 1L || is.na(positive_state_means)) {
-    stop("'positive_state_means' must be TRUE or FALSE.", call. = FALSE)
+  if (!is.null(positive_state_means)) {
+    if (!is.logical(positive_state_means) ||
+        length(positive_state_means) != 1L || is.na(positive_state_means)) {
+      stop("'positive_state_means' must be NULL, TRUE, or FALSE.",
+           call. = FALSE)
+    }
+    if (!nonnegative_was_missing &&
+        !identical(nonnegative_state_means, positive_state_means)) {
+      stop(paste("'nonnegative_state_means' and its compatibility alias",
+                 "'positive_state_means' must agree when both are supplied."),
+           call. = FALSE)
+    }
+    nonnegative_state_means <- positive_state_means
+  }
+  if (!is.logical(nonnegative_state_means) ||
+      length(nonnegative_state_means) != 1L || is.na(nonnegative_state_means)) {
+    stop("'nonnegative_state_means' must be TRUE or FALSE.", call. = FALSE)
   }
 
   automatic_mu <- is.null(mu)
@@ -106,12 +306,12 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
         min_state_fraction = min_state_fraction,
         screening_prior_sd = screening_prior_sd,
         block_size = screening_block_size,
-        positive_only = positive_state_means)
+        positive_only = nonnegative_state_means)
       mu <- grid_selection$selected_mu
     } else {
       mu <- ash_mu_grid(y, half_grid = half_grid, shape = grid_shape,
                         expansion = grid_expansion, max_abs = grid_max_abs,
-                        positive_only = positive_state_means)
+                        positive_only = nonnegative_state_means)
       grid_selection <- list(
         automatic = TRUE,
         full_mu = mu,
@@ -154,10 +354,12 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
         settings = list(prefilter = FALSE))
     }
   }
+  grid_selection$settings$nonnegative_state_means <-
+    nonnegative_state_means
 
-  if (positive_state_means) {
+  if (nonnegative_state_means) {
     if (mu[1L] != 0 || (length(mu) > 1L && any(mu[-1L] <= 0))) {
-      stop(paste("With 'positive_state_means = TRUE', mu[1] must equal zero",
+      stop(paste("With 'nonnegative_state_means = TRUE', mu[1] must equal zero",
                  "and every non-null state center must be strictly positive."),
            call. = FALSE)
     }
@@ -222,7 +424,7 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
       !scalar_nonnegative(step_penalty_scale)) {
     stop("Invalid state-mean learning or pruning control.", call. = FALSE)
   }
-  if (positive_state_means && positive_mean_floor <= 0) {
+  if (nonnegative_state_means && positive_mean_floor <= 0) {
     stop("'positive_mean_floor' must be strictly positive.", call. = FALSE)
   }
   if (is.null(step_penalty)) {
@@ -417,7 +619,7 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
       minimum_count = mean_min_effective_count,
       eligible = mean_state_enabled,
       damping = mean_damping * persistence_damping,
-      minimum = if (positive_state_means) {
+      minimum = if (nonnegative_state_means) {
         c(0, rep(positive_mean_floor, max(0L, m - 1L)))
       } else rep(-Inf, m),
       bounds = mean_bounds)
@@ -613,7 +815,13 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
     null_bic + null_bic_margin <= full_bic
   model_selection <- list(
     method = null_model_selection,
-    selected = if (collapse_to_null) "strict_null" else "positive_ash_hmm",
+    selected = if (collapse_to_null) {
+      "strict_null"
+    } else if (nonnegative_state_means) {
+      "nonnegative_ash_hmm"
+    } else {
+      "signed_ash_hmm"
+    },
     collapsed_to_null = collapse_to_null,
     full_log_likelihood = fb$log_likelihood,
     null_log_likelihood = log_null,
@@ -726,7 +934,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                             mean_min_pointmass_weight = mean_min_pointmass_weight,
                             mean_min_self_transition = mean_min_self_transition,
                             mean_damping = mean_damping,
-                            positive_state_means = positive_state_means,
+                            nonnegative_state_means = nonnegative_state_means,
+                            positive_state_means = nonnegative_state_means,
                             positive_mean_floor = positive_mean_floor),
               grid = c(grid_selection,
                        list(automatic_prior_sd = automatic_prior_sd,

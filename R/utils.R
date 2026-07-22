@@ -1,4 +1,4 @@
-.ash_hmm_version <- "1.3.0-positive-steps-null-safe"
+.ash_hmm_version <- "1.4.0-documented-nonnegative"
 
 #' Return the implementation version.
 #' @export
@@ -353,7 +353,7 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
 }
 
 .ash_hmm_component_statistics <- function(y, se, mu, prior_sd, rho,
-                                          log_emission, gamma) {
+                                           log_emission, gamma) {
   n <- length(y)
   m <- length(mu)
   l <- length(prior_sd)
@@ -568,7 +568,7 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
 # candidate. Actual deletion is accepted only after the caller checks the HMM
 # marginal likelihood.
 .ash_hmm_close_state_candidates <- function(mu, occupancy, distance,
-                                            protected = integer()) {
+                                             protected = integer()) {
   if (length(mu) < 2L || !is.finite(distance) || distance <= 0) {
     return(integer())
   }
