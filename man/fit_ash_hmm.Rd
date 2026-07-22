@@ -9,7 +9,7 @@ fit_ash_hmm(
   se,
   mu = NULL,
   prior_sd = NULL,
-  half_grid = 20L,
+  half_grid = 40L,
   grid_shape = 1.5,
   grid_expansion = 1.5,
   grid_max_abs = NULL,

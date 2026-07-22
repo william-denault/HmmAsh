@@ -48,7 +48,7 @@ from `wavethresh::DJ.EX()`:
 
 - **blocks**, representing persistent piecewise-constant levels;
 - **bumps**, representing sparse localized peaks; and
-- **Doppler**, representing a rapidly varying signed signal.
+- **Doppler**, representing a rapidly varying unconstrained signal.
 
 For observations $Y_t$ with known standard errors $s_t$, HmmAsh uses
 
@@ -66,23 +66,16 @@ Two support models are compared:
    continuous ash component is truncated to $[0,\infty)$. Posterior effects
    are therefore genuinely nonnegative, not clipped after fitting.
 2. `nonnegative_state_means = FALSE`: state centers and ash effects may be
-   signed and the continuous components are ordinary Gaussians on the real
+   unconstrained and the continuous components are ordinary Gaussians on the real
    line.
 
-**Important:** the current HmmAsh default is the first model. Thus omitting
-`nonnegative_state_means` and explicitly setting it to `TRUE` produce the same
-support constraint. A meaningful comparison requires setting it to `FALSE` in
-the signed fit.
+ 
 
 # Simulate noisy signals
-
-The same noise level is used for all three signals, but independent noise is
-drawn for each one. We avoid `rm(list = ls())` because clearing the workspace
-inside an R Markdown document can remove parameters and objects managed by
-`knitr`.
+ 
 
 ```{r simulate-data}
-set.seed(params$seed)
+set.seed(1)
 
 dj <- wavethresh::DJ.EX()
 truth <- list(
@@ -91,7 +84,7 @@ truth <- list(
   doppler = dj$doppler
 )
 
-sd_lev <- params$sd_lev
+sd_lev <- .5
 observed <- lapply(truth, function(signal) {
   signal + stats::rnorm(length(signal), sd = sd_lev)
 })
@@ -107,12 +100,11 @@ signal_range <- data.frame(
     truth, function(x) mean(x < 0), numeric(1)
   ),
   row.names = NULL
-)
-knitr::kable(signal_range, digits = 3)
+)  
 ```
 
 The proportion of negative truth values is useful when choosing the support
-model. A one-sided prior is scientifically appropriate for intensities or
+model. A non-negatived prior is scientifically appropriate for intensities or
 abundances that cannot be negative. It is intentionally misspecified for a
 signal whose negative values are meaningful.
 
@@ -155,14 +147,13 @@ fit_signal <- function(y, se, nonnegative) {
   elapsed <- system.time({
     fit <- fit_ash_hmm(
       y = y,
-      se = se,
-      half_grid = params$half_grid,
+      se = se, 
       topology = "full",
       shared_mixture = FALSE,
       nonnegative_state_means = nonnegative,
       null_state = "pointmass",
-      maxiter = params$maxiter,
-      verbose = params$verbose
+      maxiter = 50,
+      verbose = TRUE
     )
   })[["elapsed"]]
 
@@ -180,17 +171,17 @@ one_sided <- lapply(names(observed), function(name) {
 })
 names(one_sided) <- names(observed)
 
-signed <- NULL
-if (isTRUE(params$run_signed_comparison)) {
-  signed <- lapply(names(observed), function(name) {
+unconstrained <- NULL
+ 
+  unconstrained <- lapply(names(observed), function(name) {
     fit_signal(
       observed[[name]],
       standard_error[[name]],
       nonnegative = FALSE
     )
   })
-  names(signed) <- names(observed)
-}
+  names(unconstrained) <- names(observed)
+ 
 ```
 
 The calls above deliberately use `length(signal)` when constructing each
@@ -224,17 +215,17 @@ summarize_fit <- function(result, signal_name, model_name) {
 summary_rows <- do.call(
   rbind,
   lapply(names(one_sided), function(name) {
-    summarize_fit(one_sided[[name]], name, "one-sided")
+    summarize_fit(one_sided[[name]], name, "non-negatived")
   })
 )
 
-if (!is.null(signed)) {
+if (!is.null(unconstrained)) {
   summary_rows <- rbind(
     summary_rows,
     do.call(
       rbind,
-      lapply(names(signed), function(name) {
-        summarize_fit(signed[[name]], name, "signed")
+      lapply(names(unconstrained), function(name) {
+        summarize_fit(unconstrained[[name]], name, "unconstrained")
       })
     )
   )
@@ -257,15 +248,14 @@ The upper panel of each figure compares the truth with posterior means. The
 lower panel shows lfsr on its natural $[0,1]$ scale rather than multiplying it
 by 5 or 10 and placing it on the effect axis.
 
-In the one-sided model,
+In the non-negatived model,
 
 \[
 \Pr(\beta_t\ge 0\mid Y)=1,
 \qquad
 \operatorname{lfsr}_t=\Pr(\beta_t=0\mid Y),
 \]
-
-so lfsr is best interpreted as a local exact-null probability. In signed mode
+ In unconstrained mode
 it has the usual false-sign interpretation.
 
 ```{r plotting-helper}
@@ -307,7 +297,7 @@ plot_reconstruction <- function(signal_name, result, model_name) {
     col = "firebrick",
     xlab = "position",
     ylab = "lfsr",
-    main = "Local uncertainty"
+    main = "lfsr"
   )
   abline(h = c(0.05, 0.1), col = c("grey60", "grey75"), lty = c(2, 3))
 }
@@ -315,197 +305,39 @@ plot_reconstruction <- function(signal_name, result, model_name) {
 
 ## Blocks
 
-```{r blocks-one-sided}
-plot_reconstruction("blocks", one_sided$blocks, "one-sided")
+```{r blocks-non-negatived}
+plot_reconstruction("blocks", one_sided$blocks, "non-negatived")
 ```
 
-```{r blocks-signed, eval=params$run_signed_comparison}
-plot_reconstruction("blocks", signed$blocks, "signed")
+```{r blocks-unconstrained   }
+plot_reconstruction("blocks", unconstrained$blocks, "unconstrained")
 ```
 
 ## Bumps
 
-```{r bumps-one-sided}
-plot_reconstruction("bumps", one_sided$bumps, "one-sided")
+```{r bumps-non-negatived}
+plot_reconstruction("bumps", one_sided$bumps, "non-negatived")
 ```
 
-```{r bumps-signed, eval=params$run_signed_comparison}
-plot_reconstruction("bumps", signed$bumps, "signed")
+```{r bumps-unconstrained }
+plot_reconstruction("bumps", unconstrained$bumps, "unconstrained")
 ```
 
 ## Doppler
 
-```{r doppler-one-sided}
-plot_reconstruction("doppler", one_sided$doppler, "one-sided")
+```{r doppler-non-negatived}
+plot_reconstruction("doppler", one_sided$doppler, "non-negatived")
 ```
 
-```{r doppler-signed, eval=params$run_signed_comparison}
-plot_reconstruction("doppler", signed$doppler, "signed")
+```{r doppler-unconstrained }
+plot_reconstruction("doppler", unconstrained$doppler, "unconstrained")
 ```
 
 The Doppler comparison is the clearest support diagnostic. When the true
-signal crosses zero, the one-sided fit cannot represent its negative portion by
+signal crosses zero, the non-negatived fit cannot represent its negative portion by
 construction. This is correct behavior under the specified prior, not a
 numerical failure.
-
-# Learned state centers and ash mixtures
-
-The fitted center, occupancy, self-transition probability, and point-component
-weight reveal how each HMM state is being used.
-
-```{r state-table-helper}
-state_table <- function(fit) {
-  data.frame(
-    state = seq_along(fit$fitted$mu),
-    center = fit$fitted$mu,
-    occupancy = fit$fitted$state_occupancy,
-    self_transition = diag(fit$fitted$transition),
-    point_component_weight = fit$fitted$mixture_weight[, 1],
-    row.names = NULL
-  )
-}
-
-primary_fit <- function(signal_name) {
-  # Use signed support when the benchmark truth genuinely crosses zero.
-  if (!is.null(signed) && any(truth[[signal_name]] < 0)) {
-    signed[[signal_name]]$fit
-  } else {
-    one_sided[[signal_name]]$fit
-  }
-}
-```
-
-```{r learned-states, results='asis'}
-for (name in names(truth)) {
-  cat("\n\n###", tools::toTitleCase(name), "\n\n")
-  print(knitr::kable(state_table(primary_fit(name)), digits = 4))
-}
-```
-
-The rows of `fit$fitted$mixture_weight` are the separately learned ash priors.
-The heat maps below display their mass across the fixed scale grid. State
-labels on the vertical axis give the learned centers.
-
-```{r mixture-heatmap-helper}
-plot_mixture_heatmap <- function(fit, main = "State-specific ash mixtures") {
-  rho <- fit$fitted$mixture_weight
-  scales <- fit$fitted$prior_sd
-  centers <- fit$fitted$mu
-
-  if (nrow(rho) == 1L) {
-    barplot(
-      as.numeric(rho),
-      names.arg = signif(scales, 3),
-      xlab = "ash prior scale",
-      ylab = "mixture weight",
-      main = main,
-      col = "firebrick3",
-      border = NA
-    )
-    return(invisible(NULL))
-  }
-
-  if (ncol(rho) == 1L) {
-    barplot(
-      as.numeric(rho),
-      names.arg = signif(centers, 3),
-      xlab = "state center",
-      ylab = "mixture weight",
-      main = main,
-      col = "firebrick3",
-      border = NA
-    )
-    return(invisible(NULL))
-  }
-
-  image(
-    x = seq_len(ncol(rho)),
-    y = seq_len(nrow(rho)),
-    z = t(rho),
-    axes = FALSE,
-    xlab = "ash prior scale",
-    ylab = "state center",
-    main = main,
-    col = grDevices::hcl.colors(40, "YlOrRd", rev = TRUE)
-  )
-  x_at <- unique(round(seq(1, ncol(rho), length.out = min(8, ncol(rho)))))
-  y_at <- unique(round(seq(1, nrow(rho), length.out = min(12, nrow(rho)))))
-  axis(1, at = x_at, labels = signif(scales[x_at], 3), las = 2, cex.axis = 0.75)
-  axis(2, at = y_at, labels = signif(centers[y_at], 3), las = 2, cex.axis = 0.75)
-  box()
-}
-```
-
-```{r mixture-heatmaps, fig.height=8}
-old_par <- par(mfrow = c(3, 1), mar = c(5, 5, 2, 2))
-for (name in names(truth)) {
-  fit <- primary_fit(name)
-  plot_mixture_heatmap(
-    fit,
-    main = paste(tools::toTitleCase(name), "state-specific mixtures")
-  )
-}
-par(old_par)
-```
-
-A high weight in the first column means that the state behaves approximately
-like a flat point level at its learned center. Diffuse mass across positive
-scales permits within-state effect variation.
-
-# State pruning and selected steps
-
-`pruning_history` distinguishes states removed during dynamic reduction from
-states excluded by the initial independent prefilter. `step_selection` is a
-separate change-penalized decoder and directly reports contiguous segments.
-
-```{r pruning-and-steps, results='asis'}
-for (name in names(truth)) {
-  fit <- primary_fit(name)
-  cat("\n\n###", tools::toTitleCase(name), "\n\n")
-
-  initial_kept <- fit$grid$initial_selected_index %||%
-    fit$grid$selected_index %||% seq_along(fit$grid$full_mu)
-  removed_before_hmm <- length(fit$grid$full_mu) - length(initial_kept)
-  dynamically_pruned <- nrow(fit$pruning_history %||% data.frame())
-  cat(
-    "Candidates removed from the original grid:", removed_before_hmm,
-    "  \nDynamically pruned records:", dynamically_pruned,
-    "  \nDecoded steps:", fit$step_selection$step_count,
-    "  \nDecoded changes:", fit$step_selection$change_count,
-    "\n\n"
-  )
-
-  segments <- fit$step_selection$segments
-  if (nrow(segments)) {
-    print(knitr::kable(utils::head(segments, 20), digits = 4))
-    if (nrow(segments) > 20) {
-      cat("\nOnly the first 20 decoded segments are displayed.\n")
-    }
-  }
-}
-```
-
-# Practical recommendations
-
-1. Use `nonnegative_state_means = TRUE` when negative latent effects are
-   scientifically impossible. This is the current default.
-2. Use `nonnegative_state_means = FALSE` for signed waveforms such as Doppler
-   or log-fold changes whose sign is meaningful.
-3. Keep `shared_mixture = FALSE` when distinct states should learn different
-   degrees of within-state variation.
-4. Use `null_state = "pointmass"` when zero is a scientifically exact null.
-   Use an adaptive null only when small positive effects should be absorbed by
-   the zero-centered state.
-5. Inspect `fit$fitted$mu`, `fit$fitted$mixture_weight`,
-   `fit$fitted$state_occupancy`, `fit$pruning_history`, and
-   `fit$step_selection`; a posterior-mean plot alone does not diagnose the
-   fitted HMM.
-6. Do not compare the fitted HMM likelihoods of the signed and truncated models
-   as if they had identical supports. Choose the support primarily from the
-   scientific meaning of the latent effect.
-
-# Reproducibility information
-
+ 
 ```{r session-info}
 cat("HMM package:", hmm_package, "\n")
 if (exists("ash_hmm_version", mode = "function")) {
