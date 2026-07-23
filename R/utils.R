@@ -1,4 +1,4 @@
-.ash_hmm_version <- "2.0.0-one-sided-ash"
+.ash_hmm_version <- "2.1.0-fast-fb"
 
 #' Return the implementation version.
 #' @export
@@ -307,8 +307,8 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
   list(starts = starts, ends = ends)
 }
 
-.ash_hmm_forward_backward <- function(log_emission, A, init_prob, mask,
-                                      sequence_id) {
+.ash_hmm_forward_backward_log <- function(log_emission, A, init_prob, mask,
+                                          sequence_id) {
   n <- nrow(log_emission)
   m <- ncol(log_emission)
   log_A <- .ash_hmm_safe_log(A)
@@ -391,6 +391,161 @@ ash_hmm_transition_mask <- function(n_states, topology = c("hub", "full")) {
        boundary_probability = boundary_probability,
        initial_counts = colSums(gamma[segments$starts, , drop = FALSE]),
        starts = segments$starts)
+}
+
+# Fast scaled-probability forward-backward recursion. Subtracting the largest
+# log emission separately at every position prevents overflow, and the usual
+# forward scale factors prevent underflow across long sequences. Matrix
+# multiplication moves the state recursion out of interpreted R loops.
+#
+# The function returns NULL in the exceptionally ill-conditioned case where
+# all reachable scaled emissions underflow at a position. The dispatcher then
+# falls back to the fully log-domain implementation above.
+.ash_hmm_forward_backward_scaled <- function(log_emission, A, init_prob, mask,
+                                             sequence_id) {
+  n <- nrow(log_emission)
+  m <- ncol(log_emission)
+  segments <- .ash_hmm_segments(sequence_id)
+  row_shift <- apply(log_emission, 1L, max)
+  if (any(!is.finite(row_shift))) return(NULL)
+  emission <- exp(log_emission - row_shift)
+
+  A_work <- A
+  A_work[!mask] <- 0
+  alpha <- matrix(0, n, m)
+  beta <- matrix(0, n, m)
+  gamma <- matrix(0, n, m)
+  scale <- numeric(n)
+  transition_counts <- matrix(0, m, m)
+  boundary_probability <- rep(NA_real_, max(0L, n - 1L))
+  off_diagonal <- row(A_work) != col(A_work)
+  total_log_likelihood <- 0
+
+  for (segment in seq_along(segments$starts)) {
+    first <- segments$starts[segment]
+    last <- segments$ends[segment]
+
+    forward <- init_prob * emission[first, ]
+    scale[first] <- sum(forward)
+    if (!is.finite(scale[first]) || scale[first] <= 0) return(NULL)
+    alpha[first, ] <- forward / scale[first]
+    total_log_likelihood <- total_log_likelihood +
+      row_shift[first] + log(scale[first])
+
+    if (first < last) {
+      for (t in (first + 1L):last) {
+        forward <- drop(alpha[t - 1L, ] %*% A_work) * emission[t, ]
+        scale[t] <- sum(forward)
+        if (!is.finite(scale[t]) || scale[t] <= 0) return(NULL)
+        alpha[t, ] <- forward / scale[t]
+        total_log_likelihood <- total_log_likelihood +
+          row_shift[t] + log(scale[t])
+      }
+    }
+
+    beta[last, ] <- 1
+    if (first < last) {
+      for (t in (last - 1L):first) {
+        next_weight <- emission[t + 1L, ] * beta[t + 1L, ]
+        beta[t, ] <- drop(A_work %*% next_weight) / scale[t + 1L]
+      }
+    }
+
+    index <- first:last
+    smoothed <- alpha[index, , drop = FALSE] *
+      beta[index, , drop = FALSE]
+    smoothed_sum <- rowSums(smoothed)
+    if (any(!is.finite(smoothed_sum)) || any(smoothed_sum <= 0)) return(NULL)
+    gamma[index, ] <- smoothed / smoothed_sum
+
+    if (first < last) {
+      for (t in first:(last - 1L)) {
+        next_weight <- emission[t + 1L, ] * beta[t + 1L, ]
+        xi <- A_work * tcrossprod(alpha[t, ], next_weight)
+        xi_sum <- sum(xi)
+        if (!is.finite(xi_sum) || xi_sum <= 0) return(NULL)
+        xi <- xi / xi_sum
+        transition_counts <- transition_counts + xi
+        boundary_probability[t] <- sum(xi[off_diagonal])
+      }
+    }
+  }
+
+  list(log_likelihood = total_log_likelihood,
+       state_probability = gamma,
+       transition_counts = transition_counts,
+       boundary_probability = boundary_probability,
+       initial_counts = colSums(gamma[segments$starts, , drop = FALSE]),
+       starts = segments$starts)
+}
+
+# The dense scaled engine is substantially faster for the full topology. The
+# sparse log engine remains useful for large hub-and-spoke masks and is also a
+# numerical fallback. Advanced users can override the automatic choice with
+# options(ashHMM.forward_backward = "scaled") or "log".
+.ash_hmm_forward_backward <- function(
+    log_emission, A, init_prob, mask, sequence_id,
+    engine = getOption("ashHMM.forward_backward", "auto")) {
+  engine <- match.arg(engine, c("auto", "scaled", "log"))
+  if (engine == "auto") {
+    density <- sum(mask) / length(mask)
+    engine <- if (nrow(mask) <= 4L || density >= 0.25) "scaled" else "log"
+  }
+  if (engine == "log") {
+    return(.ash_hmm_forward_backward_log(
+      log_emission, A, init_prob, mask, sequence_id))
+  }
+  ans <- .ash_hmm_forward_backward_scaled(
+    log_emission, A, init_prob, mask, sequence_id)
+  if (!is.null(ans)) return(ans)
+  .ash_hmm_forward_backward_log(
+    log_emission, A, init_prob, mask, sequence_id)
+}
+
+# Likelihood-only scaled forward recursion. Optimization routines should use
+# this path when smoothing probabilities and transition counts are unnecessary.
+.ash_hmm_forward_log_likelihood <- function(
+    log_emission, A, init_prob, sequence_id, mask = A > 0) {
+  n <- nrow(log_emission)
+  row_shift <- apply(log_emission, 1L, max)
+  if (any(!is.finite(row_shift))) {
+    return(.ash_hmm_forward_backward_log(
+      log_emission, A, init_prob, mask, sequence_id)$log_likelihood)
+  }
+  emission <- exp(log_emission - row_shift)
+  A_work <- A
+  A_work[!mask] <- 0
+  segments <- .ash_hmm_segments(sequence_id)
+  total_log_likelihood <- 0
+
+  for (segment in seq_along(segments$starts)) {
+    first <- segments$starts[segment]
+    last <- segments$ends[segment]
+    forward <- init_prob * emission[first, ]
+    scale <- sum(forward)
+    if (!is.finite(scale) || scale <= 0) {
+      return(.ash_hmm_forward_backward_log(
+        log_emission, A, init_prob, mask, sequence_id)$log_likelihood)
+    }
+    forward <- forward / scale
+    total_log_likelihood <- total_log_likelihood +
+      row_shift[first] + log(scale)
+
+    if (first < last) {
+      for (t in (first + 1L):last) {
+        forward <- drop(forward %*% A_work) * emission[t, ]
+        scale <- sum(forward)
+        if (!is.finite(scale) || scale <= 0) {
+          return(.ash_hmm_forward_backward_log(
+            log_emission, A, init_prob, mask, sequence_id)$log_likelihood)
+        }
+        forward <- forward / scale
+        total_log_likelihood <- total_log_likelihood +
+          row_shift[t] + log(scale)
+      }
+    }
+  }
+  total_log_likelihood
 }
 
 .ash_hmm_component_statistics <- function(

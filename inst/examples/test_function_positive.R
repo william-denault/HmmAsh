@@ -2,7 +2,7 @@ library(wavethresh)
 library(HmmAsh)
 set.seed(1)
 blocks  = DJ.EX()$blocks
-sd_lev= 1
+sd_lev= 2
 #kind of RNA seq
 noisy_blocks=blocks+rnorm(1024, sd=sd_lev)
 plot(noisy_blocks , pch=19)

@@ -92,6 +92,11 @@
 #' @param sequence_id Vector identifying independent sequences. Adjacent equal
 #'   values belong to one sequence; transitions are not counted across changes
 #'   in `sequence_id`.
+#' @param forward_backward_engine Forward-backward implementation:
+#'   `"auto"` (default) uses the fast scaled matrix recursion for dense
+#'   transition masks and the sparse log-domain recursion for sparse masks;
+#'   `"scaled"` requests the fast recursion with automatic log-domain fallback;
+#'   `"log"` always uses the reference log-domain recursion.
 #' @param topology Transition topology used when `transition_mask` is `NULL`:
 #'   `"full"` allows all transitions; `"hub"` disallows direct transitions
 #'   between distinct non-null states.
@@ -235,6 +240,7 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                         screening_prior_sd = 0,
                         screening_block_size = 5000L,
                         sequence_id = rep(1L, length(y)),
+                        forward_backward_engine = c("auto", "scaled", "log"),
                         topology = c("full", "hub"),
                         transition_mask = NULL,
                         init_transition = NULL,
@@ -270,11 +276,12 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                         parameter_tolerance = 1e-6,
                         step_penalty = NULL,
                         step_penalty_scale = 1.5,
-                        maxiter = 50L,
+                        maxiter = 10L,
                         tolerance = 1e-5,
                         verbose = TRUE) {
   call <- match.call()
   nonnegative_was_missing <- missing(nonnegative_state_means)
+  forward_backward_engine <- match.arg(forward_backward_engine)
   topology <- match.arg(topology)
   mean_bounds <- match.arg(mean_bounds)
   null_model_selection <- match.arg(null_model_selection)
@@ -572,7 +579,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
   log_emission <- .ash_hmm_log_emission(
     y, se, mu, prior_sd, rho, effect_support)
   fb <- .ash_hmm_forward_backward(log_emission, A, init_prob,
-                                  transition_mask, sequence_id)
+                                  transition_mask, sequence_id,
+                                  engine = forward_backward_engine)
   objective <- objective_value(fb$log_likelihood, A, rho, init_prob)
   history <- data.frame(iteration = 0L,
                         log_likelihood = fb$log_likelihood,
@@ -615,7 +623,6 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
       rho_new[fixed_pointmass_states, ] <- 0
       rho_new[fixed_pointmass_states, 1L] <- 1
     }
-
     A_new <- matrix(0, m, m)
     for (state in seq_len(m)) {
       allowed <- which(transition_mask[state, ])
@@ -678,7 +685,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
     log_emission_new <- .ash_hmm_log_emission(
       y, se, mu_new, prior_sd, rho_new, effect_support)
     fb_new <- .ash_hmm_forward_backward(
-      log_emission_new, A_new, init_prob_new, transition_mask, sequence_id)
+      log_emission_new, A_new, init_prob_new, transition_mask, sequence_id,
+      engine = forward_backward_engine)
     objective_new <- objective_value(
       fb_new$log_likelihood, A_new, rho_new, init_prob_new)
 
@@ -738,7 +746,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
             log_emission_try <- .ash_hmm_log_emission(
               y, se, mu_try, prior_sd, rho_try, effect_support)
             fb_try <- .ash_hmm_forward_backward(
-              log_emission_try, A_try, init_try, mask_try, sequence_id)
+              log_emission_try, A_try, init_try, mask_try, sequence_id,
+              engine = forward_backward_engine)
             loss <- fb_new$log_likelihood - fb_try$log_likelihood
             if (is.finite(loss) && loss <= prune_max_loglik_loss) {
               objective_try <- objective_value(
@@ -911,7 +920,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
     log_emission <- .ash_hmm_log_emission(
       y, se, mu, prior_sd, rho, effect_support)
     fb <- .ash_hmm_forward_backward(
-      log_emission, A, init_prob, transition_mask, sequence_id)
+      log_emission, A, init_prob, transition_mask, sequence_id,
+      engine = forward_backward_engine)
     objective <- objective_value(
       fb$log_likelihood, A, rho, init_prob,
       transition_prior, transition_mask, mixture_prior,
@@ -962,6 +972,8 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                             mixture_weight = rho,
                             transition = A,
                             transition_mask = transition_mask,
+                            forward_backward_engine =
+                              forward_backward_engine,
                             init_prob = init_prob,
                             shared_mixture = shared_mixture,
                             null_state = if (1L %in% fixed_pointmass_states) {
@@ -1061,9 +1073,13 @@ fit_binary_markov <- function(y, se, state_means = c(0, 1),
 
   evaluate <- function(q, details = FALSE) {
     A <- matrix(c(1 - q, q, q, 1 - q), 2L, 2L, byrow = TRUE)
-    fb <- .ash_hmm_forward_backward(log_emission, A, init_prob, mask, sequence_id)
-    if (details) return(list(A = A, fb = fb))
-    fb$log_likelihood
+    if (!details) {
+      return(.ash_hmm_forward_log_likelihood(
+        log_emission, A, init_prob, sequence_id, mask))
+    }
+    fb <- .ash_hmm_forward_backward(
+      log_emission, A, init_prob, mask, sequence_id)
+    list(A = A, fb = fb)
   }
 
   grid <- seq(q_interval[1L], q_interval[2L], length.out = grid_size)

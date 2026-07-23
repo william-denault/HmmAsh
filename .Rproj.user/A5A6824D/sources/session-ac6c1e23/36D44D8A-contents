@@ -2,14 +2,14 @@ library(wavethresh)
 library(HmmAsh)
 set.seed(1)
 blocks  = DJ.EX()$blocks
-sd_lev= 1
+sd_lev= 2
 #kind of RNA seq
 noisy_blocks=blocks+rnorm(1024, sd=sd_lev)
 plot(noisy_blocks , pch=19)
 lines(blocks ,   col="green")
 bumps  = DJ.EX()$bumps
 doppler  = DJ.EX()$doppler
-  plot(bumps)
+plot(bumps)
 noisy_bumps= bumps+rnorm(1024, sd=sd_lev)
 
 noisy_doppler= doppler+rnorm(1024, sd=sd_lev)
@@ -26,6 +26,7 @@ fit_block <- fit_ash_hmm(
   rep(sd_lev, length(noisy_bumps)),
   shared_mixture = FALSE,
 
+  nonnegative_state_means = TRUE,
   verbose = TRUE
 
 )
@@ -34,16 +35,19 @@ fit_block <- fit_ash_hmm(
 fit_bumps <- fit_ash_hmm(
   noisy_bumps,
 
- rep(sd_lev, length(noisy_bumps)),
+  rep(sd_lev, length(noisy_bumps)),
   shared_mixture = FALSE,
-  verbose = TRUE
+  verbose = TRUE,
+
+  nonnegative_state_means = TRUE
 )
 fit_doppler <- fit_ash_hmm(
   noisy_doppler,
 
   rep(sd_lev, length(noisy_bumps)),
   shared_mixture = FALSE,
-  verbose = TRUE
+  verbose = TRUE,
+  nonnegative_state_means = TRUE
 )
 
 plot(fit_bumps$posterior$mean, type='l')

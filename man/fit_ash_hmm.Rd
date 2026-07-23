@@ -23,6 +23,7 @@ fit_ash_hmm(
   screening_prior_sd = 0,
   screening_block_size = 5000L,
   sequence_id = rep(1L, length(y)),
+  forward_backward_engine = c("auto", "scaled", "log"),
   topology = c("full", "hub"),
   transition_mask = NULL,
   init_transition = NULL,
@@ -58,7 +59,7 @@ fit_ash_hmm(
   parameter_tolerance = 1e-06,
   step_penalty = NULL,
   step_penalty_scale = 1.5,
-  maxiter = 50L,
+  maxiter = 10L,
   tolerance = 1e-05,
   verbose = TRUE
 )
@@ -125,6 +126,12 @@ prefilter calculations.}
 \item{sequence_id}{Vector identifying independent sequences. Adjacent equal
 values belong to one sequence; transitions are not counted across changes
 in `sequence_id`.}
+
+\item{forward_backward_engine}{Forward-backward implementation:
+`"auto"` (default) uses the fast scaled matrix recursion for dense
+transition masks and the sparse log-domain recursion for sparse masks;
+`"scaled"` requests the fast recursion with automatic log-domain fallback;
+`"log"` always uses the reference log-domain recursion.}
 
 \item{topology}{Transition topology used when `transition_mask` is `NULL`:
 `"full"` allows all transitions; `"hub"` disallows direct transitions
