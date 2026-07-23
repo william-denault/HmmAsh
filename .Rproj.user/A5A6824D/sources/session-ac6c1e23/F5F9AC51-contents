@@ -226,7 +226,7 @@
 #'
 #' @export
 fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
-                        half_grid = 40L,
+                        half_grid = 25L,
                         grid_shape = 1.5,
                         grid_expansion = 1.5,
                         grid_max_abs = NULL,
@@ -276,7 +276,7 @@ fit_ash_hmm <- function(y, se, mu = NULL, prior_sd = NULL,
                         parameter_tolerance = 1e-6,
                         step_penalty = NULL,
                         step_penalty_scale = 1.5,
-                        maxiter = 10L,
+                        maxiter = 20L,
                         tolerance = 1e-5,
                         verbose = TRUE) {
   call <- match.call()

@@ -9,7 +9,7 @@ fit_ash_hmm(
   se,
   mu = NULL,
   prior_sd = NULL,
-  half_grid = 40L,
+  half_grid = 25L,
   grid_shape = 1.5,
   grid_expansion = 1.5,
   grid_max_abs = NULL,
@@ -59,7 +59,7 @@ fit_ash_hmm(
   parameter_tolerance = 1e-06,
   step_penalty = NULL,
   step_penalty_scale = 1.5,
-  maxiter = 10L,
+  maxiter = 20L,
   tolerance = 1e-05,
   verbose = TRUE
 )

@@ -24,7 +24,6 @@ lines(doppler , col="green")
 
 fit_block <- fit_ash_hmm(
   noisy_blocks,
-  maxiter = 100,
   rep(sd_lev, length(noisy_bumps)),
   shared_mixture = FALSE,
 
@@ -35,14 +34,12 @@ fit_block <- fit_ash_hmm(
 
 fit_bumps <- fit_ash_hmm(
   noisy_bumps,
-maxiter = 100 ,
  rep(sd_lev, length(noisy_bumps)),
   shared_mixture = FALSE,
   verbose = TRUE
 )
 fit_doppler <- fit_ash_hmm(
   noisy_doppler,
-  maxiter = 100,
 
   rep(sd_lev, length(noisy_bumps)),
   shared_mixture = FALSE,
