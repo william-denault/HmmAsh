@@ -10,7 +10,7 @@ plot(noisy_blocks , pch=19)
 lines(blocks ,   col="green")
 bumps  = DJ.EX()$bumps
 doppler  = DJ.EX()$doppler
-  plot(bumps)
+plot(bumps)
 noisy_bumps= bumps+rnorm(1024, sd=sd_lev)
 
 noisy_doppler= doppler+rnorm(1024, sd=sd_lev)
@@ -22,31 +22,25 @@ plot(noisy_doppler , pch=19)
 lines(doppler , col="green")
 
 
-fit_block <- fit_ash_hmm(
+fit_block <- fit_spike_matern_hmm (
   noisy_blocks,
-  maxiter = 20,
   rep(sd_lev, length(noisy_bumps)),
-  shared_mixture = FALSE,
-
-  verbose = TRUE
+  maxiter = 20
 
 )
 
 
-fit_bumps <- fit_ash_hmm(
+fit_bumps <- fit_spike_matern_hmm (
   noisy_bumps,
-maxiter = 20  ,
- rep(sd_lev, length(noisy_bumps)),
-  shared_mixture = FALSE,
-  verbose = TRUE
-)
-fit_doppler <- fit_ash_hmm(
-  noisy_doppler,
-  maxiter = 20 ,
 
-  rep(sd_lev, length(noisy_bumps)),
-  shared_mixture = FALSE,
-  verbose = TRUE
+  rep(sd_lev, length(noisy_bumps))
+)
+fit_doppler <- fit_spike_matern_hmm (
+  noisy_doppler,
+
+  maxiter = 20,
+
+  rep(sd_lev, length(noisy_bumps))
 )
 
 plot(fit_bumps$posterior$mean, type='l')

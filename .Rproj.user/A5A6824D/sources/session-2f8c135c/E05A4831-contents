@@ -1,0 +1,1975 @@
+# SpikeMaternHMM.R
+#
+# Dependency-free empirical-Bayes fitting for a two-state spike-and-Matern
+# switching model. Half-integer Matern kernels are represented exactly as
+# low-dimensional linear state-space models. Discrete/continuous inference is
+# performed by structured mean-field updates:
+#
+#   q(z_1:T, x_1:T) = q(z_1:T) q(x_1:T).
+#
+# q(z) is an exact two-state HMM posterior and q(x) is an exact Kalman/RTS
+# posterior in the signed model. For the nonnegative log-GP model q(x) is a
+# stable iterated-Gauss-Newton Gaussian approximation.
+
+.smgp_version <- "0.2.0"
+
+#' Return the spike-and-Matern implementation version.
+#' @export
+spike_matern_version <- function() .smgp_version
+
+.smgp_logsumexp <- function(x) {
+  maximum <- max(x)
+  if (!is.finite(maximum)) return(maximum)
+  maximum + log(sum(exp(x - maximum)))
+}
+
+.smgp_row_logsumexp <- function(x) {
+  maximum <- apply(x, 1L, max)
+  answer <- rep(-Inf, nrow(x))
+  use <- is.finite(maximum)
+  if (any(use)) {
+    answer[use] <- maximum[use] +
+      log(rowSums(exp(x[use, , drop = FALSE] - maximum[use])))
+  }
+  answer
+}
+
+.smgp_safe_log <- function(x) {
+  answer <- rep(-Inf, length(x))
+  answer[x > 0] <- log(x[x > 0])
+  dim(answer) <- dim(x)
+  answer
+}
+
+.smgp_normalize <- function(x, fallback = NULL) {
+  total <- sum(x)
+  if (is.finite(total) && total > 0) return(x / total)
+  if (is.null(fallback)) {
+    stop("Cannot normalize a zero-mass probability vector.", call. = FALSE)
+  }
+  fallback / sum(fallback)
+}
+
+.smgp_symmetrize <- function(x) (x + t(x)) / 2
+
+.smgp_eigen_floor <- function(x, relative_floor = 1e-11) {
+  x <- .smgp_symmetrize(x)
+  decomposition <- eigen(x, symmetric = TRUE)
+  scale <- max(1, max(abs(decomposition$values)))
+  values <- pmax(decomposition$values, relative_floor * scale)
+  .smgp_symmetrize(
+    decomposition$vectors %*%
+      (values * t(decomposition$vectors)))
+}
+
+.smgp_stabilize_covariance <- function(x, relative_floor = 1e-12) {
+  x <- .smgp_symmetrize(x)
+  scale <- max(1, max(abs(diag(x))))
+  if (all(is.finite(x)) &&
+      all(diag(x) > relative_floor * scale)) {
+    return(x)
+  }
+  .smgp_eigen_floor(x, relative_floor)
+}
+
+.smgp_chol <- function(x, relative_jitter = 1e-11) {
+  x <- .smgp_symmetrize(x)
+  scale <- max(1, max(abs(diag(x))))
+  for (power in 0:8) {
+    jitter <- if (power == 0L) 0 else relative_jitter * scale * 10^(power - 1L)
+    answer <- tryCatch(
+      chol(x + diag(jitter, nrow(x))),
+      error = function(e) NULL)
+    if (!is.null(answer)) return(answer)
+  }
+  chol(.smgp_eigen_floor(x, relative_jitter))
+}
+
+.smgp_solve_spd <- function(x, b = NULL) {
+  factor <- .smgp_chol(x)
+  if (is.null(b)) return(chol2inv(factor))
+  backsolve(factor, forwardsolve(t(factor), b))
+}
+
+.smgp_logdet_spd <- function(x) {
+  2 * sum(log(diag(.smgp_chol(x))))
+}
+
+.smgp_segments <- function(sequence_id) {
+  starts <- c(
+    1L,
+    which(sequence_id[-1L] !=
+            sequence_id[-length(sequence_id)]) + 1L)
+  ends <- c(starts[-1L] - 1L, length(sequence_id))
+  list(starts = starts, ends = ends)
+}
+
+.smgp_check_data <- function(y, se, position, sequence_id) {
+  n <- length(y)
+  if (!is.numeric(y) || !is.numeric(se) || length(se) != n || n < 1L ||
+      anyNA(y) || anyNA(se) || any(!is.finite(y)) ||
+      any(!is.finite(se)) || any(se <= 0)) {
+    stop(paste("'y' and 'se' must be equal-length finite numeric vectors;",
+               "all standard errors must be positive."), call. = FALSE)
+  }
+  if (!is.numeric(position) || length(position) != n ||
+      anyNA(position) || any(!is.finite(position))) {
+    stop("'position' must contain one finite numeric value per observation.",
+         call. = FALSE)
+  }
+  if (length(sequence_id) != n || anyNA(sequence_id)) {
+    stop("'sequence_id' must contain one non-missing value per observation.",
+         call. = FALSE)
+  }
+  segments <- .smgp_segments(sequence_id)
+  for (segment in seq_along(segments$starts)) {
+    index <- segments$starts[segment]:segments$ends[segment]
+    if (length(index) > 1L && any(diff(position[index]) <= 0)) {
+      stop("Positions must be strictly increasing within each sequence.",
+           call. = FALSE)
+    }
+  }
+  invisible(TRUE)
+}
+
+# Continuous-time state-space representation of a unit-variance Matern GP.
+# Supported nu values have nu = p + 1/2, with state dimension p + 1.
+.smgp_matern_template <- function(nu, range) {
+  supported <- c(0.5, 1.5, 2.5)
+  if (length(nu) != 1L || !is.finite(nu) ||
+      !any(abs(nu - supported) < 1e-12)) {
+    stop("'nu' must be one of 0.5, 1.5, or 2.5.", call. = FALSE)
+  }
+  if (length(range) != 1L || !is.finite(range) || range <= 0) {
+    stop("'range' must be a finite positive scalar.", call. = FALSE)
+  }
+  order <- as.integer(round(nu - 0.5))
+  dimension <- order + 1L
+  lambda <- sqrt(2 * nu) / range
+
+  F <- matrix(0, dimension, dimension)
+  if (dimension > 1L) {
+    F[cbind(seq_len(dimension - 1L),
+            2L:dimension)] <- 1
+  }
+  F[dimension, ] <- -vapply(
+    0:(dimension - 1L),
+    function(j) choose(dimension, j) * lambda^(dimension - j),
+    numeric(1L))
+
+  L <- matrix(0, dimension, 1L)
+  L[dimension, 1L] <- 1
+  q_continuous <- 2 * sqrt(pi) * gamma(order + 1) *
+    lambda^(2 * order + 1) / gamma(order + 0.5)
+  diffusion <- L %*% t(L) * q_continuous
+  lyapunov <- kronecker(diag(dimension), F) +
+    kronecker(F, diag(dimension))
+  stationary <- matrix(
+    solve(lyapunov, -as.vector(diffusion)),
+    dimension, dimension)
+  stationary <- .smgp_symmetrize(stationary)
+  # Numerical solution of the Lyapunov equation should already give
+  # stationary[1,1] = 1. Renormalization removes tiny solver drift.
+  stationary <- stationary / stationary[1L, 1L]
+
+  list(
+    nu = nu,
+    range = range,
+    dimension = dimension,
+    lambda = lambda,
+    F = F,
+    stationary = stationary,
+    observation = c(1, rep(0, dimension - 1L)))
+}
+
+.smgp_matern_transition <- function(template, delta) {
+  if (!is.finite(delta) || delta <= 0) {
+    stop("Every within-sequence position increment must be positive.",
+         call. = FALSE)
+  }
+  dimension <- template$dimension
+  B <- template$F + diag(template$lambda, dimension)
+  series <- term <- diag(dimension)
+  if (dimension > 1L) {
+    for (k in seq_len(dimension - 1L)) {
+      term <- term %*% (B * delta) / k
+      series <- series + term
+    }
+  }
+  transition <- exp(-template$lambda * delta) * series
+  innovation <- template$stationary -
+    transition %*% template$stationary %*% t(transition)
+  innovation <- .smgp_eigen_floor(innovation, 1e-12)
+  list(A = transition, Q = innovation)
+}
+
+.smgp_build_state_model <- function(
+    position, sequence_id, nu, range, gp_variance = 1) {
+  if (!is.finite(gp_variance) || gp_variance <= 0) {
+    stop("'gp_variance' must be positive.", call. = FALSE)
+  }
+  n <- length(position)
+  template <- .smgp_matern_template(nu, range)
+  dimension <- template$dimension
+  transition <- array(0, c(dimension, dimension, max(0L, n - 1L)))
+  innovation <- array(0, c(dimension, dimension, max(0L, n - 1L)))
+  transition_group <- integer(max(0L, n - 1L))
+  unique_transition <- unique_innovation <- list()
+  boundary <- if (n > 1L) {
+    sequence_id[-1L] != sequence_id[-n]
+  } else logical()
+
+  if (n > 1L) {
+    delta <- diff(position)
+    key <- rep(NA_character_, n - 1L)
+    key[!boundary] <- format(
+      delta[!boundary], digits = 15L, scientific = TRUE, trim = TRUE)
+    unique_key <- unique(key[!is.na(key)])
+    cache <- vector("list", length(unique_key))
+    names(cache) <- unique_key
+    for (group in seq_along(unique_key)) {
+      current <- unique_key[group]
+      first <- which(key == current)[1L]
+      cache[[current]] <- .smgp_matern_transition(
+        template, delta[first])
+      unique_transition[[group]] <- cache[[current]]$A
+      unique_innovation[[group]] <-
+        cache[[current]]$Q * gp_variance
+    }
+    for (t in seq_len(n - 1L)) {
+      if (!boundary[t]) {
+        current <- cache[[key[t]]]
+        transition[, , t] <- current$A
+        innovation[, , t] <- current$Q * gp_variance
+        transition_group[t] <- match(key[t], unique_key)
+      }
+    }
+  }
+
+  list(
+    template = template,
+    dimension = dimension,
+    observation = template$observation,
+    stationary = template$stationary * gp_variance,
+    transition = transition,
+    innovation = innovation,
+    transition_group = transition_group,
+    unique_transition = unique_transition,
+    unique_innovation = unique_innovation,
+    boundary = boundary,
+    gp_variance = gp_variance)
+}
+
+# Scalar-observation Kalman filter and RTS smoother. `weight` raises each
+# Gaussian observation likelihood to a fractional power. This is exactly
+# equivalent, up to an x-independent normalizing constant, to observation
+# variance observation_variance / weight.
+.smgp_kalman_smoother <- function(
+    observation, observation_variance, weight,
+    position, sequence_id, nu, range, gp_variance,
+    minimum_weight = 1e-10) {
+  n <- length(observation)
+  model <- .smgp_build_state_model(
+    position, sequence_id, nu, range, gp_variance)
+  dimension <- model$dimension
+  H <- model$observation
+  segments <- .smgp_segments(sequence_id)
+
+  predicted_mean <- filtered_mean <- matrix(0, n, dimension)
+  predicted_covariance <- filtered_covariance <-
+    array(0, c(dimension, dimension, n))
+  smoothed_mean <- matrix(0, n, dimension)
+  smoothed_covariance <- array(0, c(dimension, dimension, n))
+  smoother_gain <- array(
+    0, c(dimension, dimension, max(0L, n - 1L)))
+  cross_covariance <- array(
+    0, c(dimension, dimension, max(0L, n - 1L)))
+  effective_variance <- rep(Inf, n)
+  innovation_variance <- rep(NA_real_, n)
+  log_pseudo_likelihood <- 0
+  information_gain <- 0
+
+  for (segment in seq_along(segments$starts)) {
+    first <- segments$starts[segment]
+    last <- segments$ends[segment]
+    for (t in first:last) {
+      if (t == first) {
+        prediction_mean <- rep(0, dimension)
+        prediction_covariance <- model$stationary
+      } else {
+        A <- model$transition[, , t - 1L]
+        Q <- model$innovation[, , t - 1L]
+        prediction_mean <- drop(A %*% filtered_mean[t - 1L, ])
+        prediction_covariance <- A %*%
+          filtered_covariance[, , t - 1L] %*% t(A) + Q
+        prediction_covariance <- .smgp_symmetrize(prediction_covariance)
+      }
+      predicted_mean[t, ] <- prediction_mean
+      predicted_covariance[, , t] <- prediction_covariance
+
+      if (is.finite(weight[t]) && weight[t] > minimum_weight) {
+        R <- observation_variance[t] / weight[t]
+        residual <- observation[t] - sum(H * prediction_mean)
+        S <- drop(H %*% prediction_covariance %*% H) + R
+        if (!is.finite(S) || S <= 0) {
+          stop("Nonpositive Kalman innovation variance.", call. = FALSE)
+        }
+        gain <- drop(prediction_covariance %*% H) / S
+        filter_mean <- prediction_mean + gain * residual
+        filter_covariance <- prediction_covariance -
+          tcrossprod(gain) * S
+        filter_covariance <- .smgp_stabilize_covariance(
+          filter_covariance, 1e-13)
+        effective_variance[t] <- R
+        innovation_variance[t] <- S
+        log_pseudo_likelihood <- log_pseudo_likelihood -
+          0.5 * (log(2 * pi * S) + residual^2 / S)
+        information_gain <- information_gain + 0.5 * log(S / R)
+      } else {
+        filter_mean <- prediction_mean
+        filter_covariance <- prediction_covariance
+      }
+      filtered_mean[t, ] <- filter_mean
+      filtered_covariance[, , t] <- filter_covariance
+    }
+
+    smoothed_mean[last, ] <- filtered_mean[last, ]
+    smoothed_covariance[, , last] <- filtered_covariance[, , last]
+    if (first < last) {
+      for (t in (last - 1L):first) {
+        A <- model$transition[, , t]
+        P_prediction <- predicted_covariance[, , t + 1L]
+        gain <- t(.smgp_solve_spd(
+          P_prediction,
+          A %*% filtered_covariance[, , t]))
+        smoother_gain[, , t] <- gain
+        smoothed_mean[t, ] <- filtered_mean[t, ] +
+          drop(gain %*%
+                 (smoothed_mean[t + 1L, ] -
+                    predicted_mean[t + 1L, ]))
+        smoothed_covariance[, , t] <-
+          filtered_covariance[, , t] +
+          gain %*%
+            (smoothed_covariance[, , t + 1L] -
+               P_prediction) %*% t(gain)
+        smoothed_covariance[, , t] <- .smgp_stabilize_covariance(
+          smoothed_covariance[, , t], 1e-13)
+        # Cov(x_t, x_{t+1} | y) = J_t P_{t+1|T}.
+        cross_covariance[, , t] <-
+          gain %*% smoothed_covariance[, , t + 1L]
+      }
+    }
+  }
+
+  prior_logdet <- length(segments$starts) *
+    .smgp_logdet_spd(model$stationary)
+  if (length(model$transition_group)) {
+    for (group in seq_along(model$unique_innovation)) {
+      prior_logdet <- prior_logdet +
+        sum(model$transition_group == group) *
+        .smgp_logdet_spd(model$unique_innovation[[group]])
+    }
+  }
+  prior_entropy <- 0.5 * (
+    n * dimension * (1 + log(2 * pi)) + prior_logdet)
+  posterior_entropy <- prior_entropy - information_gain
+
+  list(
+    mean = smoothed_mean,
+    covariance = smoothed_covariance,
+    cross_covariance = cross_covariance,
+    predicted_mean = predicted_mean,
+    predicted_covariance = predicted_covariance,
+    filtered_mean = filtered_mean,
+    filtered_covariance = filtered_covariance,
+    smoother_gain = smoother_gain,
+    effective_variance = effective_variance,
+    innovation_variance = innovation_variance,
+    log_pseudo_likelihood = log_pseudo_likelihood,
+    entropy = posterior_entropy,
+    model = model)
+}
+
+# Exact scaled forward-backward recursion for a two-state HMM.
+.smgp_binary_forward_backward <- function(
+    log_emission, transition, init_prob, sequence_id) {
+  n <- nrow(log_emission)
+  if (!is.matrix(transition) || any(dim(transition) != c(2L, 2L)) ||
+      any(transition < 0) ||
+      any(abs(rowSums(transition) - 1) > 1e-10)) {
+    stop("'transition' must be a 2 by 2 stochastic matrix.",
+         call. = FALSE)
+  }
+  init_prob <- .smgp_normalize(init_prob)
+  segments <- .smgp_segments(sequence_id)
+  shift <- apply(log_emission, 1L, max)
+  emission <- exp(log_emission - shift)
+  alpha <- beta <- gamma <- matrix(0, n, 2L)
+  scale <- numeric(n)
+  transition_counts <- matrix(0, 2L, 2L)
+  boundary_probability <- rep(NA_real_, max(0L, n - 1L))
+  log_likelihood <- 0
+  entropy <- 0
+
+  for (segment in seq_along(segments$starts)) {
+    first <- segments$starts[segment]
+    last <- segments$ends[segment]
+    forward <- init_prob * emission[first, ]
+    scale[first] <- sum(forward)
+    if (!is.finite(scale[first]) || scale[first] <= 0) {
+      stop("The HMM forward recursion has zero mass.", call. = FALSE)
+    }
+    alpha[first, ] <- forward / scale[first]
+    log_likelihood <- log_likelihood + shift[first] + log(scale[first])
+    if (first < last) {
+      for (t in (first + 1L):last) {
+        forward <- drop(alpha[t - 1L, ] %*% transition) *
+          emission[t, ]
+        scale[t] <- sum(forward)
+        if (!is.finite(scale[t]) || scale[t] <= 0) {
+          stop("The HMM forward recursion has zero mass.", call. = FALSE)
+        }
+        alpha[t, ] <- forward / scale[t]
+        log_likelihood <- log_likelihood + shift[t] + log(scale[t])
+      }
+    }
+
+    beta[last, ] <- 1
+    if (first < last) {
+      for (t in (last - 1L):first) {
+        beta[t, ] <- drop(
+          transition %*%
+            (emission[t + 1L, ] * beta[t + 1L, ])) /
+          scale[t + 1L]
+      }
+    }
+    index <- first:last
+    smoothed <- alpha[index, , drop = FALSE] *
+      beta[index, , drop = FALSE]
+    gamma[index, ] <- smoothed / rowSums(smoothed)
+    start_probability <- gamma[first, ]
+    use_start <- start_probability > 0
+    entropy <- entropy -
+      sum(start_probability[use_start] *
+            log(start_probability[use_start]))
+
+    if (first < last) {
+      for (t in first:(last - 1L)) {
+        xi <- transition * tcrossprod(
+          alpha[t, ],
+          emission[t + 1L, ] * beta[t + 1L, ])
+        xi <- xi / sum(xi)
+        transition_counts <- transition_counts + xi
+        boundary_probability[t] <- xi[1L, 2L] + xi[2L, 1L]
+        conditional <- xi
+        for (state in 1:2) {
+          if (gamma[t, state] > 0) {
+            conditional[state, ] <-
+              conditional[state, ] / gamma[t, state]
+          }
+        }
+        use <- xi > 0 & conditional > 0
+        entropy <- entropy -
+          sum(xi[use] * log(conditional[use]))
+      }
+    }
+  }
+
+  list(
+    log_likelihood = log_likelihood,
+    state_probability = gamma,
+    transition_counts = transition_counts,
+    boundary_probability = boundary_probability,
+    initial_counts = colSums(gamma[segments$starts, , drop = FALSE]),
+    entropy = entropy)
+}
+
+.smgp_binary_viterbi <- function(
+    log_emission, transition, init_prob, sequence_id) {
+  n <- nrow(log_emission)
+  log_transition <- .smgp_safe_log(transition)
+  log_init <- .smgp_safe_log(.smgp_normalize(init_prob))
+  segments <- .smgp_segments(sequence_id)
+  path <- integer(n)
+  score <- matrix(-Inf, n, 2L)
+  pointer <- matrix(1L, n, 2L)
+
+  for (segment in seq_along(segments$starts)) {
+    first <- segments$starts[segment]
+    last <- segments$ends[segment]
+    score[first, ] <- log_init + log_emission[first, ]
+    if (first < last) {
+      for (t in (first + 1L):last) {
+        for (state in 1:2) {
+          candidate <- score[t - 1L, ] +
+            log_transition[, state]
+          pointer[t, state] <- which.max(candidate)
+          score[t, state] <- max(candidate) +
+            log_emission[t, state]
+        }
+      }
+    }
+    path[last] <- which.max(score[last, ])
+    if (first < last) {
+      for (t in (last - 1L):first) {
+        path[t] <- pointer[t + 1L, path[t + 1L]]
+      }
+    }
+  }
+  path
+}
+
+.smgp_expected_gp_prior <- function(
+    gaussian, position, sequence_id, nu, range, gp_variance) {
+  model <- .smgp_build_state_model(
+    position, sequence_id, nu, range, gp_variance)
+  segments <- .smgp_segments(sequence_id)
+  dimension <- model$dimension
+  quadratic <- 0
+  log_determinant <- 0
+
+  for (segment in seq_along(segments$starts)) {
+    first <- segments$starts[segment]
+    last <- segments$ends[segment]
+    mean_first <- gaussian$mean[first, ]
+    second_first <- gaussian$covariance[, , first] +
+      tcrossprod(mean_first)
+    quadratic <- quadratic +
+      sum(diag(.smgp_solve_spd(
+        model$stationary, second_first)))
+    log_determinant <- log_determinant +
+      .smgp_logdet_spd(model$stationary)
+
+    if (first < last) {
+      for (t in first:(last - 1L)) {
+        A <- model$transition[, , t]
+        Q <- model$innovation[, , t]
+        current_mean <- gaussian$mean[t, ]
+        next_mean <- gaussian$mean[t + 1L, ]
+        mean_residual <- next_mean - drop(A %*% current_mean)
+        current_covariance <- gaussian$covariance[, , t]
+        next_covariance <- gaussian$covariance[, , t + 1L]
+        current_next <- gaussian$cross_covariance[, , t]
+        residual_covariance <- next_covariance +
+          A %*% current_covariance %*% t(A) -
+          t(current_next) %*% t(A) -
+          A %*% current_next
+        residual_second <- .smgp_symmetrize(residual_covariance) +
+          tcrossprod(mean_residual)
+        quadratic <- quadratic +
+          sum(diag(.smgp_solve_spd(Q, residual_second)))
+        log_determinant <- log_determinant +
+          .smgp_logdet_spd(Q)
+      }
+    }
+  }
+  list(
+    quadratic = quadratic,
+    log_determinant = log_determinant,
+    dimension = dimension,
+    state_model = model)
+}
+
+.smgp_gp_prior_sufficient <- function(
+    gaussian, position, sequence_id) {
+  n <- length(position)
+  dimension <- ncol(gaussian$mean)
+  segments <- .smgp_segments(sequence_id)
+  initial_second <- matrix(0, dimension, dimension)
+  for (first in segments$starts) {
+    initial_second <- initial_second +
+      gaussian$covariance[, , first] +
+      tcrossprod(gaussian$mean[first, ])
+  }
+
+  transition_groups <- list()
+  if (n > 1L) {
+    boundary <- sequence_id[-1L] != sequence_id[-n]
+    delta <- diff(position)
+    key <- rep(NA_character_, n - 1L)
+    key[!boundary] <- format(
+      delta[!boundary], digits = 15L,
+      scientific = TRUE, trim = TRUE)
+    unique_key <- unique(key[!is.na(key)])
+    transition_groups <- vector("list", length(unique_key))
+    names(transition_groups) <- unique_key
+    for (group in seq_along(unique_key)) {
+      index <- which(key == unique_key[group])
+      current_second <- next_second <- current_next <-
+        matrix(0, dimension, dimension)
+      for (t in index) {
+        current_mean <- gaussian$mean[t, ]
+        next_mean <- gaussian$mean[t + 1L, ]
+        current_second <- current_second +
+          gaussian$covariance[, , t] +
+          tcrossprod(current_mean)
+        next_second <- next_second +
+          gaussian$covariance[, , t + 1L] +
+          tcrossprod(next_mean)
+        current_next <- current_next +
+          gaussian$cross_covariance[, , t] +
+          tcrossprod(current_mean, next_mean)
+      }
+      transition_groups[[group]] <- list(
+        delta = delta[index[1L]],
+        count = length(index),
+        current_second = current_second,
+        next_second = next_second,
+        current_next = current_next)
+    }
+  }
+  list(
+    dimension = dimension,
+    n = n,
+    sequence_count = length(segments$starts),
+    initial_second = initial_second,
+    transitions = transition_groups)
+}
+
+.smgp_expected_gp_prior_sufficient <- function(
+    sufficient, nu, range, gp_variance) {
+  template <- .smgp_matern_template(nu, range)
+  stationary <- template$stationary * gp_variance
+  quadratic <- sum(diag(.smgp_solve_spd(
+    stationary, sufficient$initial_second)))
+  log_determinant <- sufficient$sequence_count *
+    .smgp_logdet_spd(stationary)
+
+  for (group in sufficient$transitions) {
+    dynamics <- .smgp_matern_transition(
+      template, group$delta)
+    A <- dynamics$A
+    Q <- dynamics$Q * gp_variance
+    residual_second <- group$next_second +
+      A %*% group$current_second %*% t(A) -
+      t(group$current_next) %*% t(A) -
+      A %*% group$current_next
+    residual_second <- .smgp_symmetrize(residual_second)
+    quadratic <- quadratic +
+      sum(diag(.smgp_solve_spd(Q, residual_second)))
+    log_determinant <- log_determinant +
+      group$count * .smgp_logdet_spd(Q)
+  }
+  list(
+    quadratic = quadratic,
+    log_determinant = log_determinant,
+    dimension = sufficient$dimension)
+}
+
+.smgp_profile_gp_hyperparameters <- function(
+    gaussian, position, sequence_id, nu,
+    current_range, current_variance, range_bounds, variance_bounds,
+    grid_size = 9L) {
+  dimension <- ncol(gaussian$mean)
+  state_dimension_count <- dimension * length(position)
+  lower <- log(range_bounds[1L])
+  upper <- log(range_bounds[2L])
+  grid_size <- max(3L, as.integer(grid_size))
+  sufficient <- .smgp_gp_prior_sufficient(
+    gaussian, position, sequence_id)
+
+  evaluate <- function(log_range, details = FALSE) {
+    range <- exp(log_range)
+    unit <- .smgp_expected_gp_prior_sufficient(
+      sufficient, nu, range, 1)
+    variance <- unit$quadratic / state_dimension_count
+    variance <- min(
+      variance_bounds[2L],
+      max(variance_bounds[1L], variance))
+    criterion <- 0.5 * (
+      unit$log_determinant +
+        state_dimension_count * log(variance) +
+        unit$quadratic / variance)
+    if (details) {
+      return(list(
+        criterion = criterion,
+        range = range,
+        variance = variance))
+    }
+    criterion
+  }
+
+  grid <- seq(lower, upper, length.out = grid_size)
+  values <- vapply(grid, evaluate, numeric(1L))
+  best <- which.min(values)
+  left <- if (best == 1L) lower else grid[best - 1L]
+  right <- if (best == grid_size) upper else grid[best + 1L]
+  refined <- stats::optimize(
+    evaluate, interval = c(left, right),
+    tol = 1e-4)
+  candidates <- c(
+    grid[best], refined$minimum,
+    min(upper, max(lower, log(current_range))))
+  candidate_values <- vapply(candidates, evaluate, numeric(1L))
+  evaluate(candidates[which.min(candidate_values)], details = TRUE)
+}
+
+.smgp_transition_update <- function(
+    counts, prior, fallback, probability_floor = 1e-8) {
+  answer <- matrix(0, 2L, 2L)
+  for (state in 1:2) {
+    numerator <- counts[state, ] + prior[state, ] - 1
+    numerator <- pmax(0, numerator)
+    answer[state, ] <- .smgp_normalize(
+      numerator, fallback = fallback[state, ])
+    answer[state, ] <- pmax(probability_floor, answer[state, ])
+    answer[state, ] <- answer[state, ] / sum(answer[state, ])
+  }
+  answer
+}
+
+.smgp_active_log_emission <- function(
+    y, se, gaussian, level, link = c("identity", "log")) {
+  link <- match.arg(link)
+  latent_mean <- level + gaussian$mean[, 1L]
+  latent_variance <- pmax(0, gaussian$covariance[1L, 1L, ])
+  if (link == "identity") {
+    expected_squared_error <-
+      (y - latent_mean)^2 + latent_variance
+  } else {
+    first_moment <- exp(pmin(700, latent_mean + latent_variance / 2))
+    second_moment <- exp(pmin(700, 2 * latent_mean + 2 * latent_variance))
+    expected_squared_error <- y^2 -
+      2 * y * first_moment + second_moment
+  }
+  -0.5 * (
+    log(2 * pi * se^2) +
+      expected_squared_error / se^2)
+}
+
+.smgp_observation_expectation <- function(
+    y, se, active_probability, gaussian, level,
+    link = c("identity", "log")) {
+  link <- match.arg(link)
+  null_log <- stats::dnorm(y, 0, se, log = TRUE)
+  active_log <- .smgp_active_log_emission(
+    y, se, gaussian, level, link)
+  sum((1 - active_probability) * null_log +
+        active_probability * active_log)
+}
+
+.smgp_discrete_prior_expectation <- function(
+    hmm, transition, init_prob) {
+  use_start <- hmm$initial_counts > 0
+  starts_term <- sum(
+    hmm$initial_counts[use_start] *
+      log(init_prob[use_start]))
+  use_transition <- hmm$transition_counts > 0
+  transition_term <- sum(
+    hmm$transition_counts[use_transition] *
+      log(transition[use_transition]))
+  starts_term + transition_term
+}
+
+.smgp_elbo <- function(
+    y, se, hmm, gaussian, level, link,
+    transition, init_prob, position, sequence_id,
+    nu, range, gp_variance) {
+  sufficient <- .smgp_gp_prior_sufficient(
+    gaussian, position, sequence_id)
+  prior <- .smgp_expected_gp_prior_sufficient(
+    sufficient, nu, range, gp_variance)
+  state_count <- length(y) * prior$dimension
+  expected_log_gp <- -0.5 * (
+    state_count * log(2 * pi) +
+      prior$log_determinant + prior$quadratic)
+  expected_observation <- .smgp_observation_expectation(
+    y, se, hmm$state_probability[, 2L],
+    gaussian, level, link)
+  expected_discrete <- .smgp_discrete_prior_expectation(
+    hmm, transition, init_prob)
+  expected_observation + expected_discrete + expected_log_gp +
+    hmm$entropy + gaussian$entropy
+}
+
+.smgp_signed_gaussian_update <- function(
+    y, se, active_probability, level,
+    position, sequence_id, nu, range, gp_variance,
+    minimum_weight = 1e-10) {
+  .smgp_kalman_smoother(
+    observation = y - level,
+    observation_variance = se^2,
+    weight = active_probability,
+    position = position,
+    sequence_id = sequence_id,
+    nu = nu,
+    range = range,
+    gp_variance = gp_variance,
+    minimum_weight = minimum_weight)
+}
+
+.smgp_gp_mean_neglog <- function(
+    state_mean, state_model, sequence_id) {
+  segments <- .smgp_segments(sequence_id)
+  answer <- 0
+  stationary_inverse <- .smgp_solve_spd(
+    state_model$stationary)
+  innovation_inverse <- lapply(
+    state_model$unique_innovation,
+    .smgp_solve_spd)
+  for (segment in seq_along(segments$starts)) {
+    first <- segments$starts[segment]
+    last <- segments$ends[segment]
+    initial <- state_mean[first, ]
+    answer <- answer + 0.5 * sum(
+      initial * drop(stationary_inverse %*% initial))
+    if (first < last) {
+      for (t in first:(last - 1L)) {
+        residual <- state_mean[t + 1L, ] -
+          drop(state_model$transition[, , t] %*%
+                 state_mean[t, ])
+        group <- state_model$transition_group[t]
+        answer <- answer + 0.5 * sum(
+          residual *
+            drop(innovation_inverse[[group]] %*% residual))
+      }
+    }
+  }
+  answer
+}
+
+.smgp_positive_mode_objective <- function(
+    state_mean, y, se, active_probability, level,
+    state_model, sequence_id) {
+  latent <- pmin(50, pmax(-50, level + state_mean[, 1L]))
+  fitted <- exp(latent)
+  .smgp_gp_mean_neglog(state_mean, state_model, sequence_id) +
+    0.5 * sum(
+      active_probability * (y - fitted)^2 / se^2)
+}
+
+# Iterated extended Kalman/RTS update for beta=exp(level + f). The covariance
+# uses the positive Gauss-Newton curvature, while a line search checks every
+# mean update against the exact weighted nonlinear objective.
+.smgp_positive_gaussian_update <- function(
+    y, se, active_probability, level,
+    position, sequence_id, nu, range, gp_variance,
+    initial_mean = NULL, inner_maxiter = 6L,
+    inner_tolerance = 1e-5, minimum_weight = 1e-10) {
+  template <- .smgp_matern_template(nu, range)
+  dimension <- template$dimension
+  n <- length(y)
+  current <- initial_mean
+  if (is.null(current) ||
+      !is.matrix(current) ||
+      any(dim(current) != c(n, dimension)) ||
+      any(!is.finite(current))) {
+    current <- matrix(0, n, dimension)
+  }
+  state_model <- .smgp_build_state_model(
+    position, sequence_id, nu, range, gp_variance)
+  current_objective <- .smgp_positive_mode_objective(
+    current, y, se, active_probability, level,
+    state_model, sequence_id)
+  last_smoother <- NULL
+  inner_maxiter <- max(1L, as.integer(inner_maxiter))
+
+  for (iteration in seq_len(inner_maxiter)) {
+    latent <- pmin(30, pmax(-30, level + current[, 1L]))
+    fitted <- exp(latent)
+    pseudo_response <- latent + (y - fitted) / fitted
+    pseudo_variance <- se^2 / fitted^2
+    smoother <- .smgp_kalman_smoother(
+      observation = pseudo_response - level,
+      observation_variance = pseudo_variance,
+      weight = active_probability,
+      position = position,
+      sequence_id = sequence_id,
+      nu = nu,
+      range = range,
+      gp_variance = gp_variance,
+      minimum_weight = minimum_weight)
+    proposal <- smoother$mean
+    fraction <- 1
+    accepted <- FALSE
+    while (fraction >= 2^-16) {
+      candidate <- current + fraction * (proposal - current)
+      candidate_objective <- .smgp_positive_mode_objective(
+        candidate, y, se, active_probability, level,
+        state_model, sequence_id)
+      if (is.finite(candidate_objective) &&
+          candidate_objective <= current_objective +
+            1e-10 * (1 + abs(current_objective))) {
+        accepted <- TRUE
+        break
+      }
+      fraction <- fraction / 2
+    }
+    last_smoother <- smoother
+    if (!accepted) break
+    change <- max(abs(candidate - current))
+    current <- candidate
+    current_objective <- candidate_objective
+    if (change <= inner_tolerance *
+        (1 + max(abs(current)))) break
+  }
+
+  if (is.null(last_smoother)) {
+    stop("The positive Gaussian update failed to initialize.",
+         call. = FALSE)
+  }
+  last_smoother$mean <- current
+  last_smoother$mode_objective <- current_objective
+  last_smoother
+}
+
+.smgp_update_level <- function(
+    y, se, active_probability, gaussian,
+    current_level, link = c("identity", "log"),
+    level_bounds = c(-20, 20)) {
+  link <- match.arg(link)
+  latent_mean <- gaussian$mean[, 1L]
+  latent_variance <- pmax(0, gaussian$covariance[1L, 1L, ])
+  weight <- active_probability / se^2
+  if (sum(weight) <= 0) return(current_level)
+
+  if (link == "identity") {
+    answer <- sum(weight * (y - latent_mean)) / sum(weight)
+  } else {
+    numerator <- sum(
+      weight * y *
+        exp(pmin(700, latent_mean + latent_variance / 2)))
+    denominator <- sum(
+      weight *
+        exp(pmin(700, 2 * latent_mean + 2 * latent_variance)))
+    if (!is.finite(numerator) || numerator <= 0 ||
+        !is.finite(denominator) || denominator <= 0) {
+      answer <- level_bounds[1L]
+    } else {
+      answer <- log(numerator / denominator)
+    }
+  }
+  min(level_bounds[2L], max(level_bounds[1L], answer))
+}
+
+.smgp_stationary_binary <- function(transition) {
+  off_sum <- transition[1L, 2L] + transition[2L, 1L]
+  if (off_sum <= 0) return(c(0.5, 0.5))
+  c(transition[2L, 1L], transition[1L, 2L]) / off_sum
+}
+
+.smgp_initial_hmm <- function(
+    y, se, level, gp_variance, link,
+    transition, init_prob, sequence_id) {
+  null_log <- stats::dnorm(y, 0, se, log = TRUE)
+  if (link == "identity") {
+    active_log <- stats::dnorm(
+      y, level, sqrt(se^2 + gp_variance), log = TRUE)
+  } else {
+    active_mean <- exp(min(50, level + gp_variance / 2))
+    active_variance <- (exp(min(50, gp_variance)) - 1) *
+      exp(min(100, 2 * level + gp_variance))
+    active_log <- stats::dnorm(
+      y, active_mean,
+      sqrt(se^2 + active_variance), log = TRUE)
+  }
+  .smgp_binary_forward_backward(
+    cbind(null_log, active_log),
+    transition, init_prob, sequence_id)
+}
+
+.smgp_transition_penalty <- function(
+    transition, transition_prior) {
+  use <- transition_prior > 1
+  if (!any(use)) return(0)
+  sum((transition_prior[use] - 1) *
+        log(transition[use]))
+}
+
+.smgp_init_penalty <- function(init_prob, init_prior) {
+  use <- init_prior > 1
+  if (!any(use)) return(0)
+  sum((init_prior[use] - 1) * log(init_prob[use]))
+}
+
+.smgp_posterior_summary <- function(
+    hmm, gaussian, level, link) {
+  active_probability <- hmm$state_probability[, 2L]
+  latent_mean <- level + gaussian$mean[, 1L]
+  latent_variance <- pmax(0, gaussian$covariance[1L, 1L, ])
+  if (link == "identity") {
+    active_mean <- latent_mean
+    active_second <- latent_variance + latent_mean^2
+    active_sd <- sqrt(latent_variance)
+    probability_positive_active <- ifelse(
+      active_sd > 0,
+      stats::pnorm(latent_mean / active_sd),
+      as.numeric(latent_mean >= 0))
+    probability_negative_active <- ifelse(
+      active_sd > 0,
+      stats::pnorm(-latent_mean / active_sd),
+      as.numeric(latent_mean <= 0))
+    probability_ge_zero <- (1 - active_probability) +
+      active_probability * probability_positive_active
+    probability_le_zero <- (1 - active_probability) +
+      active_probability * probability_negative_active
+  } else {
+    active_mean <- exp(
+      pmin(700, latent_mean + latent_variance / 2))
+    active_second <- exp(
+      pmin(700, 2 * latent_mean + 2 * latent_variance))
+    probability_ge_zero <- rep(1, length(active_probability))
+    probability_le_zero <- 1 - active_probability
+  }
+  posterior_mean <- active_probability * active_mean
+  posterior_second <- active_probability * active_second
+  posterior_variance <- pmax(
+    0, posterior_second - posterior_mean^2)
+  list(
+    mean = posterior_mean,
+    sd = sqrt(posterior_variance),
+    active_mean = active_mean,
+    active_sd = sqrt(pmax(0, active_second - active_mean^2)),
+    active_probability = active_probability,
+    null_probability = 1 - active_probability,
+    probability_ge_zero = probability_ge_zero,
+    probability_le_zero = probability_le_zero,
+    lfsr = pmin(probability_ge_zero, probability_le_zero))
+}
+
+.smgp_force_strict_null <- function(fit, unidentified_nu = FALSE) {
+  n <- length(fit$data$y)
+  fit$state_probability[, 1L] <- 1
+  fit$state_probability[, 2L] <- 0
+  fit$viterbi[] <- 1L
+
+  fit$posterior$mean[] <- 0
+  fit$posterior$sd[] <- 0
+  fit$posterior$active_probability[] <- 0
+  fit$posterior$null_probability[] <- 1
+  fit$posterior$probability_ge_zero[] <- 1
+  fit$posterior$probability_le_zero[] <- 1
+  fit$posterior$lfsr[] <- 1
+
+  if (length(fit$boundary_probability)) {
+    within_sequence <- fit$data$sequence_id[-n] ==
+      fit$data$sequence_id[-1L]
+    fit$boundary_probability[within_sequence] <- 0
+    fit$boundary_probability[!within_sequence] <- NA_real_
+  }
+  fit$hmm_log_normalizer <-
+    fit$model_selection$null_log_likelihood
+  fit$model_selection$selected <- "strict_null"
+  fit$model_selection$collapsed_to_null <- TRUE
+  fit$model_selection$nu_identified <- FALSE
+  fit$gp$identified <- FALSE
+  if (unidentified_nu) fit$gp$nu <- NA_real_
+  fit
+}
+
+#' Fit a two-state Dirac--Matern Gaussian-process HMM
+#'
+#' @description
+#' Fits a sparse-and-smooth empirical-Bayes model in which state zero is the
+#' exact point mass `beta_t = 0`, while state one exposes a latent Matern
+#' Gaussian process. The Matern process is represented by an exact
+#' low-dimensional state-space model, giving linear cost in the number of
+#' observations for `nu` equal to `0.5`, `1.5`, or `2.5`.
+#'
+#' @details
+#' The signed model is
+#' \deqn{y_t\mid z_t,f_t \sim N(z_t(\mu+f_t),s_t^2),}
+#' where `z_t` is a binary Markov chain and `f` is a zero-mean stationary
+#' Matern GP. Thus `z_t=0` is exactly a Dirac effect at zero.
+#'
+#' Exact marginalization of a GP inside a switching HMM produces an
+#' exponentially growing Gaussian mixture. This function instead uses the
+#' structured approximation
+#' \deqn{q(z_{1:T},x_{1:T})=q(z_{1:T})q(x_{1:T}).}
+#' Conditional on `q(z)`, `q(x)` is an exact Kalman/RTS posterior; conditional
+#' on `q(x)`, `q(z)` is an exact two-state forward--backward posterior.
+#' Transition probabilities, the GP level, variance, and Matern range are
+#' updated by empirical Bayes. The signed updates are coordinate-ascent
+#' variational EM.
+#'
+#' With `nonnegative = TRUE`, the active effect is
+#' \deqn{\beta_t=\exp(\mu+f_t)>0.}
+#' Its HMM emission update uses exact log-normal moments under the Gaussian
+#' approximation. The continuous update uses an iterated Gauss--Newton
+#' Kalman smoother with an exact-objective line search. This is a stable
+#' Laplace/IEKS approximation, not an exact variational coordinate update.
+#'
+#' The latent GP evolves at every position, including while the Dirac state is
+#' active. Correlation across a null stretch decays according to the Matern
+#' range and the supplied position gaps. Independent sequences reset both the
+#' GP and HMM recursions.
+#'
+#' @param y Numeric vector of noisy observations.
+#' @param se Numeric vector of known positive observation standard errors.
+#' @param position Increasing numeric coordinates. Defaults to equally spaced
+#'   positions `seq_along(y)`.
+#' @param sequence_id Vector identifying independent contiguous sequences.
+#' @param nu Matern smoothness. The exact state-space implementation supports
+#'   `0.5`, `1.5`, and `2.5`, with state dimensions one, two, and three. It is
+#'   used directly when `estimate_nu = FALSE` and ignored when
+#'   `estimate_nu = TRUE`.
+#' @param estimate_nu Logical; select the Matern smoothness by discrete
+#'   empirical Bayes. Each value in `nu_candidates` is fitted to convergence,
+#'   and the value maximizing the variational marginal-likelihood bound plus
+#'   `log(nu_prior)` is selected. If the strict null is selected, `gp$nu` and
+#'   `nu_selection$selected_nu` are `NA` because smoothness is unidentified.
+#' @param nu_candidates Candidate smoothness values used when
+#'   `estimate_nu = TRUE`. Exact linear-time state-space calculations currently
+#'   support only `0.5`, `1.5`, and `2.5`.
+#' @param nu_prior Optional positive prior probabilities for `nu_candidates`.
+#'   `NULL` uses a uniform prior. These probabilities also provide the
+#'   multiplicity adjustment when the best active model is compared with the
+#'   strict null.
+#' @param nonnegative Logical; use the true nonnegative log-GP active effect
+#'   `exp(level + f_t)` instead of the signed identity link.
+#' @param transition Optional initial 2 by 2 transition matrix. Rows correspond
+#'   to current states `(null, active)` and columns to next states.
+#' @param stay_null,stay_active Initial self-transition probabilities used when
+#'   `transition` is `NULL`.
+#' @param init_prob Initial probabilities for `(null, active)`. `NULL` uses the
+#'   stationary distribution of the initial transition matrix.
+#' @param transition_prior Scalar, length-two vector, or 2 by 2 matrix of
+#'   Dirichlet parameters. Values must be at least one.
+#' @param init_prior Scalar or length-two Dirichlet parameters used only when
+#'   `estimate_init = TRUE`.
+#' @param estimate_transition Logical; learn transition probabilities.
+#' @param estimate_init Logical; learn the initial state distribution.
+#' @param level Initial GP level. In the nonnegative model this is on the log
+#'   scale. `NULL` uses a robust data-driven initialization.
+#' @param estimate_level Logical; update the active GP level.
+#' @param gp_sd Initial marginal GP standard deviation. In the nonnegative
+#'   model it is the standard deviation on the latent log scale.
+#' @param range Initial Matern length scale in the units of `position`.
+#' @param estimate_gp_hyperparameters Logical; learn GP variance and range.
+#' @param range_bounds Optional positive lower and upper bounds for the Matern
+#'   range. `NULL` derives conservative bounds from the observed coordinates.
+#' @param gp_sd_bounds Positive lower and upper bounds for `gp_sd`. `NULL`
+#'   chooses scale-aware bounds.
+#' @param level_bounds Bounds for the level. The default is unbounded for the
+#'   signed model and `c(-20,20)` for the log-GP.
+#' @param hyper_update_every Positive number of outer iterations between GP
+#'   hyperparameter updates.
+#' @param hyper_grid_size Number of coarse log-range values used before bounded
+#'   one-dimensional refinement.
+#' @param minimum_active_weight Active probabilities below this value are
+#'   omitted from the fractional Gaussian observation update.
+#' @param positive_inner_maxiter Maximum Gauss--Newton smoothing steps per
+#'   outer iteration in the nonnegative model.
+#' @param positive_inner_tolerance Relative convergence tolerance for those
+#'   inner steps.
+#' @param transition_floor Small positive floor applied after transition
+#'   updates to prevent absorbing numerical states.
+#' @param null_model_selection `"bic"` compares the variational full-model
+#'   score with the exact all-null likelihood; `"none"` always retains the
+#'   fitted switching model.
+#' @param null_bic_margin Nonnegative extra margin required to retain the full
+#'   model over the exact null.
+#' @param maxiter Maximum number of outer variational-EM iterations.
+#' @param tolerance Relative convergence tolerance.
+#' @param verbose Logical; print iteration diagnostics.
+#'
+#' @return An object of class `spike_matern_hmm_fit`. Important components are
+#'   `posterior`, `state_probability`, `viterbi`, `transition`, `gp`,
+#'   `history`, `elbo`, `model_selection`, and `nu_selection`.
+#' @export
+fit_spike_matern_hmm <- function(
+    y, se,
+    position = seq_along(y),
+    sequence_id = rep(1L, length(y)),
+    nu = 1.5,
+    estimate_nu = FALSE,
+    nu_candidates = c(0.5, 1.5, 2.5),
+    nu_prior = NULL,
+    nonnegative = FALSE,
+    transition = NULL,
+    stay_null = 0.995,
+    stay_active = 0.98,
+    init_prob = NULL,
+    transition_prior = 1,
+    init_prior = 1,
+    estimate_transition = TRUE,
+    estimate_init = FALSE,
+    level = NULL,
+    estimate_level = TRUE,
+    gp_sd = NULL,
+    range = NULL,
+    estimate_gp_hyperparameters = TRUE,
+    range_bounds = NULL,
+    gp_sd_bounds = NULL,
+    level_bounds = NULL,
+    hyper_update_every = 5L,
+    hyper_grid_size = 7L,
+    minimum_active_weight = 1e-8,
+    positive_inner_maxiter = 1L,
+    positive_inner_tolerance = 1e-5,
+    transition_floor = 1e-8,
+    null_model_selection = c("bic", "none"),
+    null_bic_margin = 0,
+    maxiter = 100L,
+    tolerance = 1e-5,
+    verbose = FALSE) {
+  call <- match.call()
+  null_model_selection <- match.arg(null_model_selection)
+  .smgp_check_data(y, se, position, sequence_id)
+  n <- length(y)
+  if (!is.logical(nonnegative) || length(nonnegative) != 1L ||
+      is.na(nonnegative)) {
+    stop("'nonnegative' must be TRUE or FALSE.", call. = FALSE)
+  }
+  if (!is.logical(estimate_nu) || length(estimate_nu) != 1L ||
+      is.na(estimate_nu)) {
+    stop("'estimate_nu' must be TRUE or FALSE.", call. = FALSE)
+  }
+  link <- if (nonnegative) "log" else "identity"
+
+  if (estimate_nu) {
+    supported_nu <- c(0.5, 1.5, 2.5)
+    if (!is.numeric(nu_candidates) || !length(nu_candidates) ||
+        anyNA(nu_candidates) || any(!is.finite(nu_candidates)) ||
+        any(!vapply(
+          nu_candidates,
+          function(value) any(abs(value - supported_nu) < 1e-12),
+          logical(1L)))) {
+      stop(paste(
+        "'nu_candidates' must be a nonempty numeric vector containing only",
+        "0.5, 1.5, and 2.5."), call. = FALSE)
+    }
+    nu_candidates <- unique(as.numeric(nu_candidates))
+    if (is.null(nu_prior)) {
+      nu_prior <- rep(1 / length(nu_candidates), length(nu_candidates))
+    }
+    if (!is.numeric(nu_prior) || length(nu_prior) !=
+        length(nu_candidates) || anyNA(nu_prior) ||
+        any(!is.finite(nu_prior)) || any(nu_prior <= 0)) {
+      stop(paste(
+        "'nu_prior' must contain one strictly positive finite value per",
+        "candidate."), call. = FALSE)
+    }
+    nu_prior <- nu_prior / sum(nu_prior)
+
+    formal_names <- names(formals(fit_spike_matern_hmm))
+    fit_environment <- environment()
+    candidate_arguments <- lapply(
+      formal_names,
+      function(name) get(
+        name, envir = fit_environment, inherits = FALSE))
+    names(candidate_arguments) <- formal_names
+    candidate_arguments$estimate_nu <- FALSE
+    candidate_arguments$null_model_selection <- "none"
+    candidate_arguments$verbose <- FALSE
+
+    candidate_fits <- vector("list", length(nu_candidates))
+    for (candidate_index in seq_along(nu_candidates)) {
+      candidate_arguments$nu <- nu_candidates[candidate_index]
+      if (verbose) {
+        message(sprintf(
+          "fitting Matern nu=%g (%d/%d)",
+          nu_candidates[candidate_index], candidate_index,
+          length(nu_candidates)))
+      }
+      candidate_fits[[candidate_index]] <- do.call(
+        fit_spike_matern_hmm, candidate_arguments)
+    }
+
+    candidate_elbo <- vapply(
+      candidate_fits, function(fit) fit$elbo, numeric(1L))
+    candidate_log_prior <- log(nu_prior)
+    candidate_eb_score <- candidate_elbo + candidate_log_prior
+    candidate_full_bic_score <- vapply(
+      candidate_fits,
+      function(fit) fit$model_selection$full_bic_score,
+      numeric(1L)) + candidate_log_prior
+    selected_index <- which.max(candidate_eb_score)
+    selected_fit <- candidate_fits[[selected_index]]
+    selected_full_bic_score <-
+      candidate_full_bic_score[selected_index]
+    null_log_likelihood <-
+      selected_fit$model_selection$null_log_likelihood
+    collapse_to_null <- null_model_selection == "bic" &&
+      null_log_likelihood + null_bic_margin >=
+        selected_full_bic_score
+
+    selected_fit$call <- call
+    selected_fit$model_selection <- list(
+      method = if (null_model_selection == "bic") {
+        "BIC after discrete empirical-Bayes selection of nu"
+      } else {
+        "discrete empirical-Bayes selection of nu"
+      },
+      selected = if (collapse_to_null) {
+        "strict_null"
+      } else if (nonnegative) {
+        "nonnegative_log_gp"
+      } else {
+        "signed_gp"
+      },
+      collapsed_to_null = collapse_to_null,
+      full_variational_score =
+        candidate_elbo[selected_index],
+      full_eb_score = candidate_eb_score[selected_index],
+      full_bic_score = selected_full_bic_score,
+      null_log_likelihood = null_log_likelihood,
+      parameter_count =
+        selected_fit$model_selection$parameter_count,
+      margin = null_bic_margin,
+      nu_identified = !collapse_to_null)
+    selected_fit$nu_selection <- list(
+      estimated = TRUE,
+      candidates = nu_candidates,
+      prior = nu_prior,
+      elbo = candidate_elbo,
+      log_prior = candidate_log_prior,
+      eb_score = candidate_eb_score,
+      full_bic_score = candidate_full_bic_score,
+      selected_index = if (collapse_to_null) NA_integer_ else selected_index,
+      selected_nu = if (collapse_to_null) {
+        NA_real_
+      } else {
+        nu_candidates[selected_index]
+      },
+      identified = !collapse_to_null,
+      candidate_converged = vapply(
+        candidate_fits, function(fit) fit$converged, logical(1L)),
+      candidate_iterations = vapply(
+        candidate_fits, function(fit) fit$iterations, integer(1L)))
+    selected_fit$settings$estimate_nu <- TRUE
+    selected_fit$settings$nu_candidates <- nu_candidates
+    selected_fit$settings$nu_prior <- nu_prior
+    selected_fit$settings$version <- .smgp_version
+    if (collapse_to_null) {
+      selected_fit <- .smgp_force_strict_null(
+        selected_fit, unidentified_nu = TRUE)
+    } else {
+      selected_fit$gp$identified <- TRUE
+    }
+    return(selected_fit)
+  }
+
+  template <- .smgp_matern_template(nu, 1)
+  dimension <- template$dimension
+
+  scalar_probability <- function(x) {
+    is.numeric(x) && length(x) == 1L && is.finite(x) &&
+      x > 0 && x < 1
+  }
+  if (!scalar_probability(stay_null) ||
+      !scalar_probability(stay_active)) {
+    stop("'stay_null' and 'stay_active' must lie strictly inside (0,1).",
+         call. = FALSE)
+  }
+  if (is.null(transition)) {
+    transition <- matrix(
+      c(stay_null, 1 - stay_null,
+        1 - stay_active, stay_active),
+      2L, 2L, byrow = TRUE)
+  }
+  if (!is.matrix(transition) || any(dim(transition) != c(2L, 2L)) ||
+      anyNA(transition) || any(!is.finite(transition)) ||
+      any(transition < 0) ||
+      any(abs(rowSums(transition) - 1) > 1e-10)) {
+    stop("'transition' must be a finite 2 by 2 stochastic matrix.",
+         call. = FALSE)
+  }
+  if (is.null(init_prob)) {
+    init_prob <- .smgp_stationary_binary(transition)
+  }
+  if (!is.numeric(init_prob) || length(init_prob) != 2L ||
+      anyNA(init_prob) || any(!is.finite(init_prob)) ||
+      any(init_prob < 0) || sum(init_prob) <= 0) {
+    stop("'init_prob' must be a nonnegative length-two vector.",
+         call. = FALSE)
+  }
+  init_prob <- .smgp_normalize(init_prob)
+
+  expand_prior <- function(x, rows, columns, name) {
+    if (length(x) == 1L) {
+      answer <- matrix(x, rows, columns)
+    } else if (length(x) == columns) {
+      answer <- matrix(rep(x, each = rows), rows, columns)
+    } else if (is.matrix(x) && all(dim(x) == c(rows, columns))) {
+      answer <- x
+    } else {
+      stop(sprintf("'%s' has incompatible dimensions.", name),
+           call. = FALSE)
+    }
+    if (anyNA(answer) || any(!is.finite(answer)) || any(answer < 1)) {
+      stop(sprintf("Every '%s' entry must be finite and at least one.", name),
+           call. = FALSE)
+    }
+    answer
+  }
+  transition_prior <- expand_prior(
+    transition_prior, 2L, 2L, "transition_prior")
+  init_prior <- as.numeric(init_prior)
+  if (length(init_prior) == 1L) init_prior <- rep(init_prior, 2L)
+  if (length(init_prior) != 2L || anyNA(init_prior) ||
+      any(!is.finite(init_prior)) || any(init_prior < 1)) {
+    stop("'init_prior' must contain finite values of at least one.",
+         call. = FALSE)
+  }
+
+  segments <- .smgp_segments(sequence_id)
+  within_delta <- unlist(lapply(
+    seq_along(segments$starts),
+    function(segment) {
+      index <- segments$starts[segment]:segments$ends[segment]
+      if (length(index) > 1L) diff(position[index]) else numeric()
+    }), use.names = FALSE)
+  typical_delta <- if (length(within_delta)) {
+    stats::median(within_delta)
+  } else 1
+  total_span <- max(
+    typical_delta,
+    max(vapply(
+      seq_along(segments$starts),
+      function(segment) {
+        first <- segments$starts[segment]
+        last <- segments$ends[segment]
+        position[last] - position[first]
+      }, numeric(1L))))
+  if (is.null(range_bounds)) {
+    range_bounds <- c(typical_delta / 5, max(typical_delta, 2 * total_span))
+  }
+  if (!is.numeric(range_bounds) || length(range_bounds) != 2L ||
+      anyNA(range_bounds) || any(!is.finite(range_bounds)) ||
+      range_bounds[1L] <= 0 || range_bounds[2L] <= range_bounds[1L]) {
+    stop("'range_bounds' must be two increasing positive values.",
+         call. = FALSE)
+  }
+  if (is.null(range)) {
+    range <- min(
+      range_bounds[2L],
+      max(range_bounds[1L], 10 * typical_delta))
+  }
+  if (!is.finite(range) || range <= 0) {
+    stop("'range' must be positive.", call. = FALSE)
+  }
+  range <- min(range_bounds[2L], max(range_bounds[1L], range))
+
+  data_sd <- stats::sd(y)
+  if (!is.finite(data_sd)) data_sd <- 0
+  data_scale <- max(data_sd, stats::median(se), 1e-6)
+  if (is.null(gp_sd)) {
+    if (nonnegative) {
+      gp_sd <- 0.75
+    } else {
+      signal_variance <- max(
+        0, stats::var(y) - stats::median(se^2))
+      gp_sd <- max(0.25 * data_scale, sqrt(signal_variance))
+    }
+  }
+  if (is.null(gp_sd_bounds)) {
+    gp_sd_bounds <- if (nonnegative) {
+      c(0.05, 4)
+    } else {
+      c(1e-3 * data_scale, 20 * data_scale)
+    }
+  }
+  if (!is.numeric(gp_sd_bounds) || length(gp_sd_bounds) != 2L ||
+      anyNA(gp_sd_bounds) || any(!is.finite(gp_sd_bounds)) ||
+      gp_sd_bounds[1L] <= 0 ||
+      gp_sd_bounds[2L] <= gp_sd_bounds[1L]) {
+    stop("'gp_sd_bounds' must be two increasing positive values.",
+         call. = FALSE)
+  }
+  gp_sd <- min(gp_sd_bounds[2L], max(gp_sd_bounds[1L], gp_sd))
+  gp_variance <- gp_sd^2
+
+  if (is.null(level)) {
+    if (nonnegative) {
+      positive_data <- y[y > se]
+      reference <- if (length(positive_data)) {
+        stats::median(positive_data)
+      } else {
+        max(stats::quantile(y, 0.9), stats::median(se) / 10)
+      }
+      level <- log(max(reference, stats::median(se) / 100))
+    } else {
+      level <- 0
+    }
+  }
+  if (is.null(level_bounds)) {
+    level_bounds <- if (nonnegative) c(-20, 20) else c(-Inf, Inf)
+  }
+  if (!is.numeric(level_bounds) || length(level_bounds) != 2L ||
+      anyNA(level_bounds) || level_bounds[2L] <= level_bounds[1L]) {
+    stop("'level_bounds' must contain increasing non-missing values.",
+         call. = FALSE)
+  }
+  level <- min(level_bounds[2L], max(level_bounds[1L], level))
+
+  positive_integer <- function(x, name) {
+    answer <- as.integer(x)
+    if (length(answer) != 1L || is.na(answer) || answer < 1L) {
+      stop(sprintf("'%s' must be a positive integer.", name),
+           call. = FALSE)
+    }
+    answer
+  }
+  maxiter <- positive_integer(maxiter, "maxiter")
+  hyper_update_every <- positive_integer(
+    hyper_update_every, "hyper_update_every")
+  hyper_grid_size <- positive_integer(
+    hyper_grid_size, "hyper_grid_size")
+  positive_inner_maxiter <- positive_integer(
+    positive_inner_maxiter, "positive_inner_maxiter")
+  if (!is.finite(tolerance) || tolerance <= 0 ||
+      !is.finite(positive_inner_tolerance) ||
+      positive_inner_tolerance <= 0 ||
+      !is.finite(minimum_active_weight) ||
+      minimum_active_weight < 0 ||
+      !is.finite(transition_floor) ||
+      transition_floor <= 0 || transition_floor >= 0.5 ||
+      !is.finite(null_bic_margin) || null_bic_margin < 0) {
+    stop("Tolerance, weight, floor, or model-selection arguments are invalid.",
+         call. = FALSE)
+  }
+
+  hmm <- .smgp_initial_hmm(
+    y, se, level, gp_variance, link,
+    transition, init_prob, sequence_id)
+  active_probability <- hmm$state_probability[, 2L]
+  gaussian <- NULL
+  history <- data.frame(
+    iteration = integer(),
+    elbo = numeric(),
+    objective = numeric(),
+    active_count = numeric(),
+    level = numeric(),
+    gp_sd = numeric(),
+    range = numeric(),
+    p01 = numeric(),
+    p10 = numeric(),
+    maximum_change = numeric())
+  converged <- FALSE
+  previous_objective <- -Inf
+  previous_active <- active_probability
+
+  for (iteration in seq_len(maxiter)) {
+    if (nonnegative) {
+      gaussian <- .smgp_positive_gaussian_update(
+        y, se, active_probability, level,
+        position, sequence_id, nu, range, gp_variance,
+        initial_mean = if (is.null(gaussian)) NULL else gaussian$mean,
+        inner_maxiter = positive_inner_maxiter,
+        inner_tolerance = positive_inner_tolerance,
+        minimum_weight = minimum_active_weight)
+    } else {
+      gaussian <- .smgp_signed_gaussian_update(
+        y, se, active_probability, level,
+        position, sequence_id, nu, range, gp_variance,
+        minimum_weight = minimum_active_weight)
+    }
+
+    log_emission <- cbind(
+      stats::dnorm(y, 0, se, log = TRUE),
+      .smgp_active_log_emission(
+        y, se, gaussian, level, link))
+    hmm_new <- .smgp_binary_forward_backward(
+      log_emission, transition, init_prob, sequence_id)
+    active_new <- hmm_new$state_probability[, 2L]
+
+    transition_new <- transition
+    if (estimate_transition) {
+      transition_new <- .smgp_transition_update(
+        hmm_new$transition_counts,
+        transition_prior, transition, transition_floor)
+    }
+    init_new <- init_prob
+    if (estimate_init) {
+      init_new <- .smgp_normalize(
+        hmm_new$initial_counts + init_prior - 1,
+        fallback = init_prob)
+      init_new <- pmax(transition_floor, init_new)
+      init_new <- init_new / sum(init_new)
+    }
+    level_new <- level
+    if (estimate_level) {
+      level_new <- .smgp_update_level(
+        y, se, active_new, gaussian,
+        level, link, level_bounds)
+    }
+    range_new <- range
+    variance_new <- gp_variance
+    if (estimate_gp_hyperparameters &&
+        iteration %% hyper_update_every == 0L) {
+      hyper <- .smgp_profile_gp_hyperparameters(
+        gaussian, position, sequence_id, nu,
+        current_range = range,
+        current_variance = gp_variance,
+        range_bounds = range_bounds,
+        variance_bounds = gp_sd_bounds^2,
+        grid_size = hyper_grid_size)
+      range_new <- hyper$range
+      variance_new <- hyper$variance
+    }
+
+    elbo <- .smgp_elbo(
+      y, se, hmm_new, gaussian, level_new, link,
+      transition_new, init_new, position, sequence_id,
+      nu, range_new, variance_new)
+    objective <- elbo +
+      .smgp_transition_penalty(
+        transition_new, transition_prior) +
+      if (estimate_init) {
+        .smgp_init_penalty(init_new, init_prior)
+      } else 0
+    maximum_change <- max(
+      max(abs(active_new - previous_active)),
+      max(abs(transition_new - transition)),
+      max(abs(init_new - init_prob)),
+      abs(level_new - level) /
+        (1 + abs(level)),
+      abs(log(range_new / range)),
+      abs(log(sqrt(variance_new / gp_variance))))
+
+    history <- rbind(
+      history,
+      data.frame(
+        iteration = iteration,
+        elbo = elbo,
+        objective = objective,
+        active_count = sum(active_new),
+        level = level_new,
+        gp_sd = sqrt(variance_new),
+        range = range_new,
+        p01 = transition_new[1L, 2L],
+        p10 = transition_new[2L, 1L],
+        maximum_change = maximum_change))
+    if (verbose) {
+      message(sprintf(
+        paste0(
+          "iter=%d objective=%.6f active=%.2f ",
+          "level=%.4g gp_sd=%.4g range=%.4g change=%.3g"),
+        iteration, objective, sum(active_new),
+        level_new, sqrt(variance_new), range_new,
+        maximum_change))
+    }
+
+    objective_change <- objective - previous_objective
+    transition <- transition_new
+    init_prob <- init_new
+    level <- level_new
+    range <- range_new
+    gp_variance <- variance_new
+    hmm <- hmm_new
+    active_probability <- active_new
+    previous_active <- active_new
+
+    if (iteration >= 3L &&
+        maximum_change <= sqrt(tolerance) &&
+        abs(objective_change) <=
+          tolerance * (1 + abs(previous_objective))) {
+      converged <- TRUE
+      previous_objective <- objective
+      break
+    }
+    previous_objective <- objective
+  }
+
+  # One final pair of E-updates aligns the returned continuous and discrete
+  # posteriors with the final EB parameters.
+  if (nonnegative) {
+    gaussian <- .smgp_positive_gaussian_update(
+      y, se, active_probability, level,
+      position, sequence_id, nu, range, gp_variance,
+      initial_mean = gaussian$mean,
+      inner_maxiter = positive_inner_maxiter,
+      inner_tolerance = positive_inner_tolerance,
+      minimum_weight = minimum_active_weight)
+  } else {
+    gaussian <- .smgp_signed_gaussian_update(
+      y, se, active_probability, level,
+      position, sequence_id, nu, range, gp_variance,
+      minimum_weight = minimum_active_weight)
+  }
+  log_emission <- cbind(
+    stats::dnorm(y, 0, se, log = TRUE),
+    .smgp_active_log_emission(
+      y, se, gaussian, level, link))
+  hmm <- .smgp_binary_forward_backward(
+    log_emission, transition, init_prob, sequence_id)
+  elbo <- .smgp_elbo(
+    y, se, hmm, gaussian, level, link,
+    transition, init_prob, position, sequence_id,
+    nu, range, gp_variance)
+  objective <- elbo +
+    .smgp_transition_penalty(transition, transition_prior) +
+    if (estimate_init) {
+      .smgp_init_penalty(init_prob, init_prior)
+    } else 0
+
+  null_log_likelihood <- sum(
+    stats::dnorm(y, 0, se, log = TRUE))
+  number_parameters <- 2L * as.integer(estimate_transition) +
+    as.integer(estimate_level) +
+    2L * as.integer(estimate_gp_hyperparameters) +
+    as.integer(estimate_init)
+  full_bic_score <- elbo -
+    0.5 * number_parameters * log(max(2, n))
+  collapse_to_null <- null_model_selection == "bic" &&
+    null_log_likelihood + null_bic_margin >= full_bic_score
+  model_selection <- list(
+    method = null_model_selection,
+    selected = if (collapse_to_null) {
+      "strict_null"
+    } else if (nonnegative) {
+      "nonnegative_log_gp"
+    } else {
+      "signed_gp"
+    },
+    collapsed_to_null = collapse_to_null,
+    full_variational_score = elbo,
+    full_bic_score = full_bic_score,
+    null_log_likelihood = null_log_likelihood,
+    parameter_count = number_parameters,
+    margin = null_bic_margin,
+    nu_identified = !collapse_to_null)
+
+  posterior <- .smgp_posterior_summary(
+    hmm, gaussian, level, link)
+  viterbi <- .smgp_binary_viterbi(
+    log_emission, transition, init_prob, sequence_id)
+  answer <- list(
+    call = call,
+    data = list(
+      y = y, se = se, position = position,
+      sequence_id = sequence_id),
+    posterior = posterior,
+    state_probability = hmm$state_probability,
+    viterbi = viterbi,
+    boundary_probability = hmm$boundary_probability,
+    transition = transition,
+    init_prob = init_prob,
+    gp = list(
+      nu = nu,
+      identified = !collapse_to_null,
+      range = range,
+      sd = sqrt(gp_variance),
+      variance = gp_variance,
+      level = level,
+      link = link,
+      latent_mean = level + gaussian$mean[, 1L],
+      latent_variance = gaussian$covariance[1L, 1L, ],
+      state_mean = gaussian$mean,
+      state_covariance = gaussian$covariance,
+      approximation = if (nonnegative) {
+        "structured mean-field with Gauss-Newton Laplace/IEKS"
+      } else {
+        "structured mean-field with exact Gaussian coordinate"
+      }),
+    log_emission = log_emission,
+    hmm_log_normalizer = hmm$log_likelihood,
+    elbo = elbo,
+    objective = objective,
+    history = history,
+    converged = converged,
+    iterations = nrow(history),
+    model_selection = model_selection,
+    settings = list(
+      position = position,
+      sequence_id = sequence_id,
+      nonnegative = nonnegative,
+      estimate_nu = FALSE,
+      nu_candidates = nu,
+      nu_prior = 1,
+      estimate_transition = estimate_transition,
+      estimate_init = estimate_init,
+      estimate_level = estimate_level,
+      estimate_gp_hyperparameters =
+        estimate_gp_hyperparameters,
+      range_bounds = range_bounds,
+      gp_sd_bounds = gp_sd_bounds,
+      transition_prior = transition_prior,
+      init_prior = init_prior,
+      version = .smgp_version))
+  answer$nu_selection <- list(
+    estimated = FALSE,
+    candidates = nu,
+    prior = 1,
+    elbo = elbo,
+    log_prior = 0,
+    eb_score = elbo,
+    full_bic_score = full_bic_score,
+    selected_index = 1L,
+    selected_nu = nu,
+    identified = !collapse_to_null,
+    candidate_converged = converged,
+    candidate_iterations = nrow(history))
+  class(answer) <- "spike_matern_hmm_fit"
+  if (collapse_to_null) {
+    answer <- .smgp_force_strict_null(
+      answer, unidentified_nu = FALSE)
+  }
+  answer
+}
+
+#' @export
+print.spike_matern_hmm_fit <- function(x, ...) {
+  cat("Two-state Dirac--Matern GP HMM\n")
+  cat("  observations:", nrow(x$state_probability), "\n")
+  cat("  selected model:", x$model_selection$selected, "\n")
+  cat("  active posterior count:",
+      format(sum(x$posterior$active_probability), digits = 5), "\n")
+  if (is.na(x$gp$nu)) {
+    cat("  Matern nu: NA (unidentified under strict null)\n")
+  } else {
+    cat("  Matern nu:", x$gp$nu,
+        " range:", format(x$gp$range, digits = 5),
+        " GP sd:", format(x$gp$sd, digits = 5), "\n")
+  }
+  cat("  link:", x$gp$link,
+      " iterations:", x$iterations,
+      " converged:", x$converged, "\n")
+  invisible(x)
+}
+
+#' @export
+plot.spike_matern_hmm_fit <- function(
+    x, credible_level = 0.95,
+    show_observations = TRUE, ...) {
+  probability <- 1 - (1 - credible_level) / 2
+  critical <- stats::qnorm(probability)
+  position <- x$data$position
+  mean <- x$posterior$mean
+  lower <- mean - critical * x$posterior$sd
+  upper <- mean + critical * x$posterior$sd
+  if (x$gp$link == "log") lower <- pmax(0, lower)
+  old <- graphics::par(no.readonly = TRUE)
+  on.exit(graphics::par(old), add = TRUE)
+  graphics::par(mfrow = c(2, 1), mar = c(3, 4, 2, 1))
+  limits <- range(c(lower, upper, x$data$y), finite = TRUE)
+  graphics::plot(
+    position, mean, type = "n", ylim = limits,
+    xlab = "", ylab = "effect", ...)
+  graphics::polygon(
+    c(position, rev(position)),
+    c(lower, rev(upper)),
+    border = NA, col = grDevices::adjustcolor("steelblue", 0.2))
+  if (show_observations) {
+    graphics::points(
+      position, x$data$y, pch = 16, cex = 0.35,
+      col = grDevices::adjustcolor("grey30", 0.45))
+  }
+  graphics::lines(position, mean, col = "steelblue4", lwd = 2)
+  graphics::abline(h = 0, lty = 3)
+  graphics::plot(
+    position, x$posterior$active_probability,
+    type = "l", ylim = c(0, 1), col = "firebrick",
+    lwd = 2, xlab = "position", ylab = "P(active)")
+  graphics::abline(h = 0.5, lty = 3)
+  invisible(x)
+}
+
+#' Simulate from a two-state Dirac--Matern GP HMM
+#'
+#' @param n Number of observations. Ignored when `position` is supplied.
+#' @param se Scalar or vector of observation standard errors.
+#' @param position Optional increasing coordinates.
+#' @param sequence_id Optional independent-sequence identifiers.
+#' @param nu Matern smoothness: `0.5`, `1.5`, or `2.5`.
+#' @param range Matern length scale.
+#' @param gp_sd Marginal standard deviation of the latent GP.
+#' @param level Active-process level; it is on the log scale when
+#'   `nonnegative = TRUE`.
+#' @param nonnegative Logical; simulate `exp(level + f_t)` in the active state.
+#' @param transition Two-state transition matrix.
+#' @param init_prob Initial state probabilities.
+#' @param seed Optional random seed.
+#' @return A list containing `y`, `se`, `beta`, `state`, `latent`,
+#'   `position`, and `sequence_id`.
+#' @export
+simulate_spike_matern_hmm <- function(
+    n = 1000L,
+    se = 1,
+    position = NULL,
+    sequence_id = NULL,
+    nu = 1.5,
+    range = 20,
+    gp_sd = 2,
+    level = 0,
+    nonnegative = FALSE,
+    transition = matrix(
+      c(0.995, 0.005, 0.02, 0.98),
+      2L, 2L, byrow = TRUE),
+    init_prob = NULL,
+    seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  if (is.null(position)) {
+    n <- as.integer(n)
+    if (length(n) != 1L || is.na(n) || n < 1L) {
+      stop("'n' must be a positive integer.", call. = FALSE)
+    }
+    position <- seq_len(n)
+  } else {
+    n <- length(position)
+  }
+  if (is.null(sequence_id)) sequence_id <- rep(1L, n)
+  se <- rep(se, length.out = n)
+  .smgp_check_data(rep(0, n), se, position, sequence_id)
+  if (!is.matrix(transition) || any(dim(transition) != c(2L, 2L)) ||
+      any(transition < 0) ||
+      any(abs(rowSums(transition) - 1) > 1e-10)) {
+    stop("'transition' must be a 2 by 2 stochastic matrix.",
+         call. = FALSE)
+  }
+  if (is.null(init_prob)) {
+    init_prob <- .smgp_stationary_binary(transition)
+  }
+  init_prob <- .smgp_normalize(init_prob)
+  model <- .smgp_build_state_model(
+    position, sequence_id, nu, range, gp_sd^2)
+  dimension <- model$dimension
+  segments <- .smgp_segments(sequence_id)
+  state_vector <- matrix(0, n, dimension)
+  state <- integer(n)
+
+  draw_gaussian <- function(covariance) {
+    drop(t(.smgp_chol(covariance)) %*%
+           stats::rnorm(nrow(covariance)))
+  }
+  for (segment in seq_along(segments$starts)) {
+    first <- segments$starts[segment]
+    last <- segments$ends[segment]
+    state_vector[first, ] <- draw_gaussian(model$stationary)
+    state[first] <- sample.int(2L, 1L, prob = init_prob)
+    if (first < last) {
+      for (t in (first + 1L):last) {
+        state_vector[t, ] <-
+          drop(model$transition[, , t - 1L] %*%
+                 state_vector[t - 1L, ]) +
+          draw_gaussian(model$innovation[, , t - 1L])
+        state[t] <- sample.int(
+          2L, 1L, prob = transition[state[t - 1L], ])
+      }
+    }
+  }
+  latent <- level + state_vector[, 1L]
+  active_effect <- if (nonnegative) exp(latent) else latent
+  beta <- ifelse(state == 2L, active_effect, 0)
+  y <- beta + stats::rnorm(n, sd = se)
+  list(
+    y = y,
+    se = se,
+    beta = beta,
+    active_effect = active_effect,
+    state = state,
+    latent = latent,
+    position = position,
+    sequence_id = sequence_id,
+    parameters = list(
+      nu = nu, range = range, gp_sd = gp_sd,
+      level = level, nonnegative = nonnegative,
+      transition = transition, init_prob = init_prob))
+}
+
+# Sourced scripts do not receive the package-level ByteCompile optimization.
+# Compile the hot pure-R recursions when the standard compiler namespace is
+# available; installed packages can additionally set ByteCompile: true.
+if (requireNamespace("compiler", quietly = TRUE)) {
+  .smgp_kalman_smoother <- compiler::cmpfun(
+    .smgp_kalman_smoother)
+  .smgp_binary_forward_backward <- compiler::cmpfun(
+    .smgp_binary_forward_backward)
+  .smgp_expected_gp_prior <- compiler::cmpfun(
+    .smgp_expected_gp_prior)
+  .smgp_gp_prior_sufficient <- compiler::cmpfun(
+    .smgp_gp_prior_sufficient)
+  .smgp_positive_gaussian_update <- compiler::cmpfun(
+    .smgp_positive_gaussian_update)
+}

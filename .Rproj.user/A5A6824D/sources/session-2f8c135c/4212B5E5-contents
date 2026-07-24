@@ -1,0 +1,150 @@
+---
+title: "Response to Reviewer 469v"
+subtitle: "Submission 7903 --- Nash: Neural Adaptive Shrinkage for Structured High-Dimensional Regression"
+output:
+  pdf_document:
+    number_sections: false
+    latex_engine: pdflatex
+fontsize: 10pt
+geometry: margin=1in
+header-includes:
+  - \usepackage{amsmath,amssymb}
+  - \usepackage{xcolor}
+  - \newcommand{\rev}[1]{\textcolor{blue}{#1}}
+---
+
+We thank the reviewer for a summary that captures the contribution more
+accurately than we managed to state it ourselves. The central criticism --- that
+the reader cannot tell which examples genuinely require split VEB and which are
+already tractable under standard CAVI --- is correct, and we believe it explains
+why the paper reads as harder than it should. We have restructured the relevant
+material accordingly.
+
+---
+
+## W1 & Q1. Which examples need split VEB, and why is CAVI expensive?
+
+The reviewer's observation about Eqs. (10)--(11) is exactly right: for those
+prior families, conventional methods *can* compute efficiently. We conflated
+cases where split VEB is a convenience with cases where it is a necessity, and
+the resulting presentation obscured the contribution.
+
+**Why the coupling arises.** The mechanism deserves a plain statement in the
+main text, which it currently lacks. Under direct CAVI on the target model
+(Corollary A.7), the M-step solves
+
+$$
+\hat\theta = \arg\max_\theta \prod_{j=1}^p \int
+\mathcal{N}\!\left(\hat\beta_{j,\mathrm{MLE}};\, \beta_j,\, s_j^2\right)
+g(\beta_j; d_j, \theta)\, d\beta_j ,
+\qquad
+\hat\beta_{j,\mathrm{MLE}} = x_j^\top \bar r_j / (n-1).
+$$
+
+The difficulty is in the sufficient statistic. Since
+$\bar r_j = y - \sum_{j' \neq j} x_{j'}\bar\beta_{j'}$, updating *any* single
+coordinate changes $\hat\beta_{j',\mathrm{MLE}}$ for *every* other $j'$, so the
+objective above changes after each coordinate update and $\hat\theta$ must be
+refit. With a closed-form M-step this is cheap; with a neural network it means
+$p$ forward--backward passes per sweep.
+
+Nash breaks this by feeding the M-step the shrinkage estimate
+$\bar\beta_j = \omega\hat\beta_{j,\mathrm{MLE}} + (1-\omega)\bar b_j$, which is a
+smooth function of $\bar b_j$ and can be updated for all $p$ coordinates *before*
+the network is retrained --- hence one batched M-step per sweep.
+
+\rev{Revision: the two paragraphs above have been promoted from Appendix A.3
+into Section 3.2, immediately after Eq. (7), with the appendix retained for the
+formal statement.}
+
+**Which examples require it.** We have added the table the reviewer asks for.
+
+| Prior family | M-step under direct CAVI | Cost per sweep | Split VEB needed? |
+|:--|:--|:--|:--|
+| Constant $\pi$ (ash / mr.ash) | Closed form (EBNM) | $\mathcal{O}(Kp)$ | No --- CAVI is efficient |
+| Group one-hot, linear $\pi$ | Closed form per group (multinomial) | $\mathcal{O}(Kp)$ | No --- CAVI is efficient |
+| Group one-hot, MLP $\pi$ (Eq. 10--11) | Iterative; requires NN fit | $\mathcal{O}(p)$ backward passes | Yes |
+| Continuous index, MDN (Eq. 15) | Iterative; requires NN fit | $\mathcal{O}(p)$ backward passes | Yes |
+| Graph / fused GNN prior (Eq. 13--14) | Iterative; neighbourhood-coupled | $\mathcal{O}(p)$ backward passes, non-local | Yes --- and impractical at MNIST scale |
+
+\rev{This is now Table 2 in Section 4, and each example paragraph in Section 4
+carries an explicit marker indicating which row it belongs to.}
+
+To be direct about it: the ash and group-linear cases are included because they
+show Nash *subsumes* existing penalties, not because it is needed for them.
+mr.ash already handles the first efficiently, and we should have said so. The
+contribution is confined to the last three rows, where the prior is an arbitrary
+learned function of $d_j$ --- and the MNIST experiment (Section 5.5) is the case
+where standard CAVI is not merely slow but infeasible, since the prior couples
+each pixel to its neighbours through a two-layer message-passing network.
+
+---
+
+## Q2. Extension to generalised linear models
+
+There is one substantial obstacle, and it is not the split itself.
+
+The split structure --- a latent Gaussian layer decoupling prior learning from
+posterior inference --- carries over to any likelihood without modification. What
+does not carry over is the **E-step conjugacy**. In the Gaussian case, the
+sub-model
+
+$$
+\bar r_j = x_j\beta_j + \varepsilon, \quad \varepsilon \sim \mathcal{N}(0,\sigma^2 I),
+\qquad \beta_j \sim \mathcal{N}(\bar b_j, \sigma_0^2)
+$$
+
+is conjugate, so $q^*_{\beta_j}$ has the closed form of Eq. (24) and each
+coordinate update costs a single dot product (Remark 3.1). Under a non-Gaussian
+likelihood this posterior is no longer available in closed form, and a naive
+extension would replace an $\mathcal{O}(n)$ update with an inner optimisation ---
+which would forfeit the efficiency that motivates the method.
+
+Two routes appear workable:
+
+1. **Pólya-Gamma augmentation** for logistic and negative-binomial likelihoods.
+   Introducing PG latent variables renders the conditional for $\beta_j$
+   Gaussian, restoring the closed-form E-step and leaving the split intact. The
+   cost is one additional latent variable per observation and an extra
+   coordinate-ascent block; the $\mathcal{O}(1)$ M-step per sweep is preserved.
+   This is the route we consider most promising.
+2. **Gaussian approximation of the likelihood** (Laplace or variational
+   quadratic bounds), yielding pseudo-observations with observation-specific
+   weights. This is more general but introduces an approximation error not
+   controlled by $\sigma_0^2$, so the relaxation hierarchy of Remark A.8 would
+   no longer apply cleanly.
+
+We have not implemented either, and we do not want to overstate what is
+established. \rev{Revision: the Limitations section now states the obstacle
+(E-step conjugacy, not the split) and describes the Pólya-Gamma route
+concretely, rather than the current one-line remark that the method is
+"restricted to Gaussian likelihoods."}
+
+---
+
+## On the clarity of Appendix A.3
+
+The reviewer notes that A.3 is terse and hard to follow on first reading. We
+agree. \rev{In addition to promoting the core argument to Section 3.2 (above),
+A.3 has been expanded with a worked example at $p = 3$ showing explicitly how a
+single coordinate update perturbs every other sufficient statistic, and how the
+latent layer removes that dependence. We have also added a schematic contrasting
+the two computational graphs --- $p$ sequential network evaluations versus one
+batched evaluation --- which we hope makes the point visible before the algebra.}
+
+---
+
+## Summary of changes
+
+| Point | Change |
+|:--|:--|
+| W1 | Coupling mechanism promoted from A.3 to Section 3.2 with a plain-language derivation |
+| Q1 | New Table 2 classifying every prior family by whether direct CAVI suffices; Section 4 examples cross-referenced to it; ash and group-linear cases explicitly acknowledged as not requiring split VEB |
+| Q2 | Limitations rewritten: obstacle identified as E-step conjugacy; Pólya-Gamma and Gaussian-approximation routes described |
+| A.3 | Expanded with a $p=3$ worked example and a computational-graph schematic |
+
+We are grateful for the framing in the review's summary, which we have borrowed
+from in revising the introduction. The suggestion to state per-example which
+regime applies has, we think, improved the paper more than its brevity
+suggests --- it forced us to be honest about where the contribution does and does
+not bind.

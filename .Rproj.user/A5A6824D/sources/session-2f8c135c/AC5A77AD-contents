@@ -1,0 +1,183 @@
+---
+title: "Response to Reviewer DSau"
+subtitle: "Submission 7903 --- Nash: Neural Adaptive Shrinkage for Structured High-Dimensional Regression"
+output:
+  pdf_document:
+    number_sections: false
+    latex_engine: pdflatex
+fontsize: 10pt
+geometry: margin=1in
+header-includes:
+  - \usepackage{amsmath,amssymb}
+  - \usepackage{xcolor}
+  - \newcommand{\rev}[1]{\textcolor{blue}{#1}}
+---
+
+We thank the reviewer for a careful and constructive reading. The four major
+points identify genuine gaps in our exposition, and one of them (Q3) identifies
+a claim we were not sufficiently precise about. We address each below and
+indicate the corresponding revisions.
+
+---
+
+## Q1. Derivation from Eq. (4) to Eq. (5); the appearance of $\hat{\theta}$
+
+The reviewer is right that $\hat{\theta}$ enters Eq. (5) without introduction.
+This is an omission on our part rather than a substantive step.
+
+Equations (3)--(5) describe the two stages of the empirical Bayes procedure.
+Stage 1 (Eq. 3) estimates the prior parameters by maximum marginal likelihood,
+producing $\hat{\theta}$. Stage 2 then computes the posterior *conditional on
+that estimate*, i.e. treating $\hat\theta$ as fixed:
+
+$$
+p_{\mathrm{post}}(\beta) \;=\; p(\beta \mid y, X, D, \hat\theta, \sigma^2)
+\;\propto\; p(y \mid X, \beta, \sigma^2)\, g(\beta; D, \hat\theta).
+$$
+
+The proportionality in Eq. (5) is with respect to $\beta$, with the marginal
+likelihood absorbed into the normalising constant.
+
+\rev{Revision: we now define $\hat\theta$ explicitly at Eq. (3), carry it
+through the conditioning bar in Eq. (4), and add one sentence noting that this
+plug-in step is the standard EB approximation --- the posterior does not account
+for uncertainty in $\hat\theta$.}
+
+---
+
+## Q2. Is $\sigma^2$ known or estimated?
+
+$\sigma^2$ is estimated. The presentation was inconsistent, and we have fixed it.
+
+Section 3.1 introduces the EB procedure with $\sigma^2$ held fixed purely so
+that the two-step structure (learn $\theta$, then compute the posterior) is
+visible without a third moving part. Once we move to the coordinate ascent,
+both $\sigma^2$ and $\sigma_0^2$ are treated as free parameters and optimised
+against the ELBO, with closed forms given in Appendix A.1.3, Eqs. (33)--(34):
+
+$$
+(\sigma^2)^* = \frac{1}{n}\Big( \|y - X\bar\beta\|_2^2 + (n-1)\textstyle\sum_j s_j^2 \Big),
+\qquad
+(\sigma_0^2)^* = \frac{1}{p}\textstyle\sum_j \big( s_j^2 + (\bar\beta_j - \bar b_j)^2 + V_{q_{b_j}} \big).
+$$
+
+\rev{Revision: Eq. (6) is now stated with $\sigma^2$ as an unknown parameter,
+with a footnote pointing forward to A.1.3. The phrase "Assuming that $\sigma^2$
+is known" at line 90 has been changed to "For exposition, we first hold
+$\sigma^2$ fixed; it is estimated jointly in the algorithm of Section 3.2."}
+
+---
+
+## Q3. Equivalence of the target model and the augmented model
+
+We are grateful for this question, because our original wording overstated the
+relationship. **The augmented model is not equivalent to the target model, and
+we should not have implied otherwise.** It is a relaxation, indexed by
+$\sigma_0^2$, that recovers the target model in the limit.
+
+The precise statement follows from Proposition A.6. Marginalising $\beta_j$ out
+of the augmented model gives
+
+$$
+\log p(\bar r_j \mid b_j, \sigma^2, \sigma_0^2)
+= \log \mathcal{N}\!\left(\hat\beta_{j,\mathrm{MLE}};\, b_j,\, s_j^2 + \sigma_0^2\right) + C,
+\qquad s_j^2 = \sigma^2/(n-1),
+$$
+
+whereas the target model (Corollary A.7) yields the same cEBNM problem with
+noise variance $s_j^2$ and the exact statistic $\hat\beta_{j,\mathrm{MLE}}$.
+So Nash differs from the target in exactly two respects, both governed by
+$\sigma_0^2$:
+
+1. the effective noise is inflated from $s_j^2$ to $s_j^2 + \sigma_0^2$;
+2. the M-step is driven by the shrinkage estimate
+   $\bar\beta_j = \omega\hat\beta_{j,\mathrm{MLE}} + (1-\omega)\bar b_j$
+   rather than by $\hat\beta_{j,\mathrm{MLE}}$ itself, where
+   $\omega = (n-1)\sigma_0^2/(\sigma^2 + (n-1)\sigma_0^2)$.
+
+Both vanish as $\sigma_0^2 \to 0$, and Proposition A.6 shows the limit is taken
+without a $1/\sigma_0^2$ blow-up. The marginal priors coincide only in that
+limit, which is precisely the reviewer's point.
+
+What makes this workable in practice is that $\sigma_0^2$ is not a tuning
+parameter: it is estimated by maximising the Nash ELBO, so the algorithm selects
+its own position on the accuracy--decoupling trade-off. Small $\sigma_0^2$
+tightens the approximation to the target; large $\sigma_0^2$ buys decoupling.
+
+To answer "how close?" empirically rather than only asymptotically, we have
+added:
+
+- **Fitted $\sigma_0^2$ across all experiments.** Reported in a new appendix
+  table, alongside $\omega$, so the reader can see how much shrinkage the
+  relaxation actually introduces. \rev{[TODO: fill from runs --- report
+  $\hat\sigma_0^2$ and $\hat\omega$ per dataset.]}
+- **Direct comparison at small $p$.** For $p \in \{100, 500\}$ where direct CAVI
+  on the target model is affordable, we compare Nash and direct CAVI on (i) the
+  target-model ELBO at convergence, (ii) $\|\hat\beta_{\text{Nash}} -
+  \hat\beta_{\text{CAVI}}\|_2$, and (iii) test RMSE.
+  \rev{[TODO: fill in --- new Table 8.]}
+
+\rev{Revision: Section 3.2 now describes the augmented model as a continuous
+relaxation rather than an equivalent reformulation, with a forward reference to
+Remark A.8; the Discussion lists the relaxation as a limitation.}
+
+---
+
+## Q4. Total computing time
+
+This is a fair criticism, raised independently by all three reviewers. Table 1
+isolates the M-step because that is where the two algorithms differ
+asymptotically --- the E-step is $\mathcal{O}(np)$ for both --- but reporting
+only the component we improve is not the right way to present a computational
+claim.
+
+\rev{Revision: we now report end-to-end wall-clock time for every method in
+every experiment (simulations and real data), together with the hardware
+specification, in a new Table 9. Table 1 is retained as a decomposition, with
+the text amended to state clearly that the $74$--$106\times$ figure refers to
+the M-step alone and that the end-to-end factor is smaller.}
+\rev{[TODO: total timings for Nash, mr.ash, Lasso, Enet, Ridge, XGBoost, MLP,
+ipf-Lasso across SNP500 / Airpassenger / GSE40279 / TCGA; CPU model, core count,
+RAM.]}
+
+We should also note, for completeness, that the E-step is not identical in cost
+between the two methods in wall-clock terms even though it matches in order,
+since Nash's update reduces to a single dot product per coordinate (Remark 3.1).
+
+---
+
+## Minor comments
+
+**M1. Undefined symbols.** \rev{We have added a notation table (new Appendix
+A.0) and defined at first use every symbol flagged, together with
+$\omega$, $s_j^2$, $V_{q_{b_j}}$, $L_{jm}$, $\bar r_j$ and $\Sigma_j$.}
+
+**M2. $P$ vs $p$.** These denote the same quantity. \rev{All occurrences are now
+$p$; the products in Eqs. (7) and (12) have been corrected.}
+
+**M3. Is prediction based on $\hat\beta$ or $\bar b$?** Predictions use the
+posterior mean of the regression coefficients, $\bar\beta$, which is the
+Bayes-optimal point predictor under squared error; $\bar b$ is the posterior
+mean of the latent layer and is not the predictive coefficient. The reviewer has
+correctly caught an inconsistency: Algorithm 1 returns $\bar b$, and Appendix
+B.1 refers to $\hat\beta$. \rev{Algorithm 1 now returns $(\bar\beta, \bar b,
+\hat\theta, \sigma^2)$, and Appendix B.1 states that RMSE is computed as
+$\|y_{\text{test}} - X_{\text{test}}\bar\beta\|_2/\sqrt{n}$. We have verified
+that the released implementation uses $\bar\beta$; the reported numbers are
+unaffected.}
+
+---
+
+## Summary of changes
+
+| Point | Change |
+|:--|:--|
+| Q1 | $\hat\theta$ defined at Eq. (3) and carried into Eqs. (4)--(5) |
+| Q2 | $\sigma^2$ presented as unknown throughout; pointer to A.1.3 |
+| Q3 | Augmented model reframed as a relaxation, not an equivalence; new empirical evidence on $\hat\sigma_0^2$ and small-$p$ agreement with direct CAVI |
+| Q4 | End-to-end timings and hardware for all methods and datasets |
+| M1--M3 | Notation table; $P \to p$; prediction rule stated and verified |
+
+We hope these revisions --- particularly the corrected framing in Q3 and the
+timing results in Q4 --- address the concerns about quality and clarity, and we
+thank the reviewer again for identifying them precisely.

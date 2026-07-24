@@ -1,0 +1,86 @@
+---
+title: "General Response to All Reviewers"
+subtitle: "Submission 7903 --- Nash: Neural Adaptive Shrinkage for Structured High-Dimensional Regression"
+output:
+  pdf_document:
+    number_sections: false
+    latex_engine: pdflatex
+fontsize: 10pt
+geometry: margin=1in
+header-includes:
+  - \usepackage{amsmath,amssymb}
+  - \usepackage{xcolor}
+  - \newcommand{\rev}[1]{\textcolor{blue}{#1}}
+---
+
+We thank all three reviewers for their time. Three concerns recur across the
+reviews, and we address them here to avoid repetition in the individual
+responses.
+
+## 1. Total computational cost (all reviewers)
+
+Table 1 reports M-step time only. All three reviewers noted, correctly, that
+this is not sufficient to support a computational claim. We now report
+**end-to-end wall-clock time for every method on every dataset**, with hardware
+specifications, and we have amended the abstract and Section 5.3 to state that
+the $74$--$106\times$ figure refers to the M-step in isolation.
+\rev{[TODO: Table 9.]}
+
+## 2. Evaluation is limited to predictive RMSE (9KyP; implicitly DSau)
+
+An adaptive shrinkage prior should be judged on what it selects, not only on
+what it predicts. We have added **AUPRC for support recovery, TPR at fixed FDR,
+$\ell_2$ coefficient error, and posterior inclusion probability calibration**
+across both synthetic settings and all values of $p$, reported per group in the
+known-groups design. \rev{[TODO: Tables 12--13.]}
+
+## 3. Positioning of the contribution (469v; 9KyP)
+
+Two reviewers found it difficult to identify what is new, from opposite
+directions: one asked which examples genuinely require our algorithm, the other
+noted that covariate-dependent priors are standard in hierarchical Bayes. Both
+are right, and the two concerns have a common resolution.
+
+Our contribution is **not** the covariate-dependent prior --- that is a familiar
+modelling device --- and **not** a general-purpose speedup for empirical Bayes
+regression. It is that split VEB makes an *arbitrary neural parameterisation* of
+the prior computable at scale, in a regime where direct CAVI requires
+$\mathcal{O}(p)$ network backward passes per sweep and MCMC is infeasible. For
+closed-form prior families (ash, group-linear), standard CAVI is already
+efficient and our method offers no advantage; we have said so explicitly and
+added a table classifying each example accordingly.
+
+\rev{Sections 1, 2 and 4 have been revised to make this scope explicit.}
+
+## 4. A clarification on the design assumption
+
+Our presentation invited a misreading, and we want to correct it plainly: **Nash
+does not require a fixed design, and our simulations do not use one.** In every
+scenario of Appendix B.1 and B.2 the matrix $X$ is drawn independently in each
+replicate, so all reported errors are averaged over the design distribution
+rather than conditional on a single realisation. The derivation conditions on $X$
+in the usual sense for penalised and empirical Bayes regression, but assumes
+nothing about it being non-random.
+
+The ambiguity came from Table 3, whose "Fixed parameters" column refers to
+simulation settings held constant and not to a fixed design matrix.
+\rev{We have relabelled that column and stated the per-replicate redraw
+explicitly in Appendix B.1.}
+
+Separately --- and this is a real limitation rather than a misreading --- our
+designs are Gaussian, and our noise is homoscedastic and independent in all
+scenarios (Eq. 55). \rev{We have added non-Gaussian designs ($t_3$ rows;
+discrete genotype-like columns) and non-standard residual structures
+(heteroscedastic; AR(1) correlated), and the Limitations section now states the
+homoscedasticity assumption, which it previously did not.}
+\rev{[TODO: Tables 14--15.]}
+
+## 5. A correction
+
+In response to Reviewer DSau's third question, we note a claim requiring
+correction: the augmented model is **not** equivalent to the target model. It is
+a relaxation indexed by $\sigma_0^2$ that recovers the target model as
+$\sigma_0^2 \to 0$ (Proposition A.6, Remark A.8). We have reframed Section 3.2
+accordingly and added empirical evidence --- fitted $\hat\sigma_0^2$ across
+experiments, and a small-$p$ comparison against direct CAVI on the target-model
+ELBO --- characterising how close the relaxation is in practice.

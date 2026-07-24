@@ -1,0 +1,233 @@
+---
+title: "Response to Reviewer 9KyP"
+subtitle: "Submission 7903 --- Nash: Neural Adaptive Shrinkage for Structured High-Dimensional Regression"
+output:
+  pdf_document:
+    number_sections: false
+    latex_engine: pdflatex
+fontsize: 10pt
+geometry: margin=1in
+header-includes:
+  - \usepackage{amsmath,amssymb}
+  - \usepackage{xcolor}
+  - \newcommand{\rev}[1]{\textcolor{blue}{#1}}
+---
+
+We thank the reviewer for engaging with the paper's positioning. The comments on
+baselines, evaluation metrics, and the relationship to hierarchical Bayes are
+well taken; we have run additional experiments in response and have substantially
+revised how we describe our contribution relative to prior work.
+
+---
+
+## Q1. Experimental setting; relation between $\beta$ and the predictors; Bayesian baselines
+
+**On clarity of the setting.** We agree the description was too compressed. The
+relationship between the coefficients and the side information --- which is the
+quantity of interest --- is specified in Appendix B.2 but not stated where the
+reader first needs it.
+
+\rev{Revision: Section 5.2 now states the generative mechanism inline. In the
+known-groups design, predictors are partitioned into five groups and
+$\beta_j \sim \pi_{0,k(j)}\delta_0 + (1-\pi_{0,k(j)})\mathcal{N}(0,
+\sigma^2_{s,k(j)})$, so that group membership determines both sparsity and signal
+magnitude (Table 4). In the continuous-index design, $t_j \sim
+\mathrm{Unif}(0,3)$ and $\beta_j = 0$ on two null bands, with $\beta_j \sim
+\mathcal{N}(0, \sigma(t_j)^2)$ elsewhere, $\sigma(t) = 0.01 + |\sin(\pi t)|$.
+The side information is $d_j = $ one-hot group indicator and $d_j = t_j$
+respectively.}
+
+**On sparsity patterns.** The reviewer writes that we vary signal magnitude but
+not the sparsity pattern. This is accurate for the *baseline comparison* of
+Section 5.1, which reuses the design of Kim et al. (2024) --- but not for
+Section 5.2, where $\pi_0$ varies across groups from $1.00$ (fully null) to
+$0.00$ (dense), and where the continuous-index design has structurally zero
+regions. That said, the reviewer's underlying point stands: in Section 5.1 the
+side information carries no information by construction, so Nash cannot separate
+from mr.ash there, and that section is better understood as a check that Nash
+loses nothing in the no-side-information regime than as a demonstration of the
+method.
+
+\rev{Revision: Section 5.1 is now explicitly framed as a null-side-information
+sanity check, and we have added a design in which sparsity structure --- not
+merely amplitude --- varies with $d_j$ at fixed marginal sparsity, isolating the
+structural signal.} \rev{[TODO: new Table 10.]}
+
+**On frequentist baselines.** We accept this criticism. Lasso and Elastic Net
+treat $\beta$ as fixed and are not directly comparable as inference procedures,
+even if they are the standard predictive baselines in this literature (and the
+ones used by Kim et al. 2024, which is why we adopted them). We have added
+Bayesian competitors:
+
+- **Horseshoe** and **regularised horseshoe** (global--local shrinkage, no side
+  information);
+- **Spike-and-slab with group-level hyperpriors**, which is the natural Bayesian
+  analogue of Nash in the known-groups setting and the closest existing method
+  that uses the same side information;
+- **mr.ash**, already included, which is itself an empirical Bayes procedure.
+
+\rev{[TODO: results --- new Table 11, both synthetic settings and all four real
+datasets.]}
+
+The spike-and-slab-with-group-hyperpriors comparison is the informative one: it
+shares Nash's modelling assumption in the grouped case and differs only in how
+the prior is parameterised and fitted. We expect comparable accuracy there and a
+large computational gap; the continuous-index and graph settings are where the
+neural parameterisation is not straightforwardly replaced.
+
+---
+
+## Q2. Additional metrics, in particular variable selection
+
+We think this is the single most useful suggestion in the reviews, and we have
+acted on it. RMSE alone is a weak instrument for evaluating an adaptive
+shrinkage prior --- prediction error can be nearly flat across methods that
+differ substantially in which coefficients they select, and selection is exactly
+where covariate-dependent regularisation should help.
+
+\rev{Revision: we now report, for both synthetic settings and across all
+$p \in \{100, 500, 1000, 10000\}$:}
+
+- **AUPRC** for recovery of the non-zero support (precision--recall is
+  preferable to ROC given the class imbalance at high sparsity);
+- **TPR at fixed FDR** ($5\%$ and $10\%$), computed from the local false sign
+  rate for the empirical Bayes methods and from the standard selection paths for
+  the penalised methods;
+- **Coefficient estimation error** $\|\hat\beta - \beta\|_2$, which separates
+  shrinkage quality from predictive performance;
+- **Calibration** of the posterior inclusion probabilities for Nash, mr.ash and
+  the spike-and-slab baseline.
+
+\rev{[TODO: new Tables 12--13 and calibration figure.]}
+
+These are reported per group in the known-groups design, since the interesting
+question is whether Nash's group-specific priors improve selection in the *weak,
+sparse* group (group 2) without sacrificing the *dense, strong* group (group 4)
+--- a trade-off that a single pooled prior cannot make.
+
+---
+
+## Q3. Novelty relative to hierarchical Bayes
+
+The reviewer is right that covariate-dependent priors are not new, and our
+framing did not acknowledge this adequately. We have rewritten Section 2 to make
+the claim narrower and, we hope, defensible.
+
+**What is not new.** Making the prior depend on covariate-level features is
+standard in hierarchical Bayesian modelling. Relevant precedents include
+annotation-informed priors in statistical genetics, Bayesian group and fused
+lassos (Casella et al. 2010; Betancourt et al. 2017), hierarchical spike-and-slab
+models with group-level hyperparameters, and the broader literature on
+structured shrinkage. \rev{Revision: these are now cited and discussed in
+Section 2 rather than treated as absent.}
+
+**What we claim is new.** Not the model class, but the estimation strategy that
+makes an *arbitrary neural parameterisation* of that prior tractable in the
+$p \gg n$ regime without MCMC and without cross-validation. Specifically:
+
+- Existing hierarchical approaches either impose a conjugate or low-dimensional
+  hyperprior (so the M-step is closed-form) or resort to MCMC (so the cost is
+  prohibitive at $p \sim 10^5$). Neither accommodates $g(\cdot; d_j, \theta)$
+  with $\theta$ the weights of an MLP or GNN.
+- Direct CAVI on such a model couples prior learning to every coordinate
+  update: $\hat\beta_{j,\mathrm{MLE}}$ changes whenever any other coordinate
+  changes, so $\hat\theta$ must be refit after each one --- $\mathcal{O}(p)$
+  backward passes per sweep (Corollary A.7).
+- Split VEB removes this coupling via a latent Gaussian layer, giving one
+  batched M-step per sweep regardless of $p$.
+
+The contribution, then, is that a familiar modelling idea becomes computable at
+a scale and with a prior flexibility where it previously was not. \rev{Section 2
+now states this as the contribution, and the Discussion no longer claims novelty
+for the covariate-dependent prior itself.}
+
+---
+
+## Q4. Fixed design and Gaussian likelihood
+
+We think we expressed ourselves poorly here, and the reviewer's reading is a
+reasonable one given what we wrote. There are two separate issues in this
+comment, and our answer differs between them: on the design we believe there is
+a misunderstanding that is our fault to have invited, while on the residual
+structure the reviewer identifies a genuine gap.
+
+**On fixed versus random design.** Nash does not require a fixed design, and our
+simulations are not conducted under one. The method conditions on $X$ in the
+sense that all quantities in the coordinate ascent are computed given the
+observed design --- as is standard for penalised and empirical Bayes regression
+--- but nothing in the derivation treats $X$ as non-random, and our empirical
+results are averaged over the design distribution.
+
+Concretely, in Appendix B.1 a design matrix $X \in \mathbb{R}^{n\times p}$ is
+drawn for *each replicate*, and in Appendix B.2 the entries are sampled i.i.d.
+from $N(0,1)$ per replicate. Since each setting is replicated 20 times (100 for
+the correlation sweep), the reported errors and confidence intervals are already
+averages over independent draws of $X$, not conditional on a single realised
+design. In that sense the experiments are random-design already.
+
+We suspect the confusion arose because Table 3 labels the design types ("Indep",
+"Equicorr") without stating that $X$ is regenerated each replicate, and because
+the phrase "fixed parameters" in that table refers to the simulation settings
+held constant, not to a fixed design matrix. \rev{Revision: Appendix B.1 now
+states explicitly that $X$ is drawn independently in every replicate, the Table 3
+column has been relabelled "Held-fixed settings" to avoid the collision, and
+Section 3.1 notes that the derivation conditions on $X$ without assuming it is
+non-random.} We are grateful to the reviewer for surfacing this, since the
+ambiguity was ours.
+
+**On the Gaussianity of the design.** Distinct from the above, our designs are
+Gaussian (independent or equicorrelated columns), which is a real restriction and
+one that matters for the genomic applications we target, where covariates are
+methylation $\beta$-values or discrete genotype dosages. \rev{Revision: we have
+added two non-Gaussian designs --- rows drawn from a multivariate $t_3$, and
+discrete genotype-like columns sampled from $\{0,1,2\}$ under Hardy--Weinberg
+proportions with MAF $\sim \mathrm{Unif}(0.05, 0.5)$ --- across both synthetic
+settings.} \rev{[TODO: new Table 14.]} We note that the per-coordinate update
+depends on $X$ only through $x_j^\top \bar r_j$ and $x_j^\top x_j$ (Remark 3.1),
+so we do not anticipate a qualitative change, but this should be demonstrated
+rather than argued.
+
+**On the noise model.** Here we want to be careful not to overclaim. Our existing
+experiments do vary the *level* of noise: Supplementary Figure 6, lower panels,
+sweeps the signal-to-noise ratio across $\mathrm{PVE} \in \{0.0, 0.1, \ldots,
+0.9\}$ (second panel from the left) and the sample size across $n \in \{200,
+\ldots, 5000\}$ (first panel), so performance is characterised from the
+essentially-null regime through to high SNR. Separately, the "Varying $h$" panels
+sweep the *signal* distribution over Student-$t$ with $1, 2, 4, 8$ degrees of
+freedom, Laplace, uniform and point-mass, in both dense and sparse regimes.
+
+What none of these vary is the *structure* of the residuals: Eq. (55) fixes
+$\varepsilon \sim \mathcal{N}(0, \sigma^2 I_n)$ throughout, so the noise is
+homoscedastic and independent in every scenario. The reviewer's request for "more
+complex residual forms" is therefore not addressed by the existing figures, and
+we do not wish to imply otherwise. \rev{Revision: we have added a heteroscedastic
+design ($\varepsilon_i \sim \mathcal{N}(0, \sigma_i^2)$, $\sigma_i$ varying
+across observations) and a correlated-error design (AR(1) with $\rho = 0.5$).}
+\rev{[TODO: new Table 15.]} We expect some loss of calibration in these settings,
+since the ELBO in Eq. (30) assumes homoscedasticity and its $\sigma^2$ update
+(Eq. 33) estimates a single scalar variance; reporting where the method degrades
+seems more useful than omitting the case. \rev{The Limitations section now states
+the homoscedasticity assumption explicitly, which it previously did not.}
+
+**Beyond Gaussian.** Extending to GLMs is not a matter of relabelling: the
+E-step conjugacy in Eqs. (22)--(24) is what makes the update a single dot
+product, and it fails for a non-Gaussian likelihood. For logistic regression,
+Pólya-Gamma augmentation restores conditional Gaussianity and preserves the
+split structure at the cost of one additional latent layer per observation; we
+regard this as the natural next step, but it is not implemented here and we now
+say so explicitly in the Limitations.
+
+---
+
+## Summary of changes
+
+| Point | Change |
+|:--|:--|
+| Q1 | Generative mechanism stated inline; Section 5.1 reframed as null-side-information check; new sparsity-structure design; horseshoe, regularised horseshoe and hierarchical spike-and-slab baselines added |
+| Q2 | AUPRC, TPR at fixed FDR, $\ell_2$ coefficient error, and PIP calibration added throughout, reported per group |
+| Q3 | Section 2 rewritten: hierarchical-Bayes precedents cited; novelty claim narrowed to tractable estimation under arbitrary neural priors |
+| Q4 | Clarified that $X$ is redrawn per replicate (random design already); Table 3 column relabelled; non-Gaussian ($t_3$, genotype-like) designs added; heteroscedastic and AR(1) noise added; homoscedasticity stated in Limitations; GLM extension described concretely |
+
+We are grateful for the push on baselines and metrics in particular --- the
+selection results are, in our view, a clear improvement to the paper, and we
+would not have run them otherwise.

@@ -1,0 +1,22 @@
+fit_short <- fit_spike_matern_hmm(
+  noisy_doppler, rep(1, 1024),
+  nu = 1.5,
+  range = 8,
+  estimate_gp_hyperparameters = FALSE,
+  maxiter = 30
+)
+
+fit_long <- fit_spike_matern_hmm(
+  noisy_doppler, rep(1, 1024),
+  nu =  2.5,
+  range = 20,
+  estimate_gp_hyperparameters =TRUE,
+  maxiter = 100
+)
+
+plot(fit_short$posterior$active_mean, type = "l")
+lines(fit_long$posterior$active_mean, col = "blue")
+
+lines( fit_long$posterior$lfsr,col="red")
+
+lines(doppler, col = "green", lwd = 2)

@@ -1,0 +1,27 @@
+{
+    "id": "BED8CC31",
+    "path": "C:/Document/Serieux/Travail/Package/HmmAsh/inst/examples/test_hmmMattern_non_negative.R",
+    "project_path": "inst/examples/test_hmmMattern_non_negative.R",
+    "type": "r_source",
+    "hash": "3478184697",
+    "contents": "",
+    "dirty": false,
+    "created": 1784910178345.0,
+    "source_on_save": false,
+    "relative_order": 13,
+    "properties": {
+        "tempName": "Untitled3",
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "70,0",
+        "scrollLine": "53"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1784911022,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1784911022409,
+    "read_only": false,
+    "read_only_alternatives": []
+}
